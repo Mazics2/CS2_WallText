@@ -17,6 +17,7 @@ public class WallTextData
 
     public bool Enabled { get; set; } = true;
     public string ColorHex { get; set; } = "#FFFFFF";
+    public string FontName { get; set; } = "";
     public float FontSize { get; set; } = 24f;
     public float Scale { get; set; } = 0.4f;
     public bool Background { get; set; } = false;
@@ -25,6 +26,9 @@ public class WallTextData
 
     /// <summary>0 = Left, 1 = Center, 2 = Right</summary>
     public int JustifyHorizontal { get; set; } = 1;
+
+    /// <summary>0 = Bottom, 1 = Center, 2 = Top</summary>
+    public int JustifyVertical { get; set; } = 1;
 
     public float DepthOffset { get; set; } = 0.5f;
 

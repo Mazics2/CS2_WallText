@@ -23,58 +23,71 @@ namespace CS2WallText;
 /// Main module for CS2_WallText:
 /// - Precise trace-based aiming with auto-upright wall snapping.
 /// - Rainbow (RGB) cycle effects.
-/// - Rotating Text Announcer (cycles multiple messages on a wall every 20-30s).
-/// - Interactable Text Buttons (+USE / Shoot triggers with sound and commands).
-/// - Instant Crosshair positioning and quick orientation tools (90°, 180°, Face Admin).
+/// - Rotating Text Announcer (cycles multiple messages on a wall with real-time placeholder support).
+/// - Interactable Text Buttons (+USE / Shoot triggers with sound, cooldown, and commands).
+/// - Instant Crosshair positioning, wall-relative nudging, and quick orientation tools.
 /// </summary>
 public class WallTextModule
 {
     private const string MenuTag = "CS2WallText.Menu";
-    private const float CaptureDebounceSeconds = 0.15f;
+    private const float CaptureDebounceSeconds = 0.25f;
     private const float WallOffset = 1.0f;
+
+    private static readonly float[] AvailableSteps = [1f, 5f, 15f, 45f, 90f];
+    private static readonly string[] AvailableFonts = ["", "Arial", "Impact", "Trebuchet MS", "Verdana", "Consolas", "Tahoma"];
 
     private readonly ISwiftlyCore _core;
     private readonly MapContext _mapContext;
 
     private WallTextConfig _config = new();
     private string _configPath = "";
+    private bool _isRegistered;
     private Guid _commandGuid;
     private Guid _chatHookGuid;
     private Guid _roundStartHookGuid;
 
     private readonly Dictionary<string, WallTextData> _store = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, CPointWorldText> _liveEntities = new(StringComparer.OrdinalIgnoreCase);
+    // Stored as entity handles (index + serial) so a stale/reused entity index is never mistaken for our text
+    private readonly Dictionary<string, CHandle<CPointWorldText>> _liveEntities = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _dynamicTextRenderCache = new(StringComparer.OrdinalIgnoreCase);
 
-    // Pending chat inputs per player SteamID
-    private readonly Dictionary<ulong, string> _pendingRename = new();
-    private readonly Dictionary<ulong, string> _pendingTextChange = new();
-    private readonly Dictionary<ulong, PendingCreation> _pendingNewText = new();
-    private readonly Dictionary<ulong, string> _pendingColorChange = new();
-    private readonly Dictionary<ulong, string> _pendingAddRotatingMsg = new();
-    private readonly Dictionary<ulong, string> _pendingInteractMsg = new();
-    private readonly Dictionary<ulong, string> _pendingInteractCmd = new();
+    private enum ChatPromptKind
+    {
+        NewText,
+        ChangeText,
+        Rename,
+        ColorHex,
+        AddRotatingMessage,
+        InteractMessage,
+        InteractCommand
+    }
 
-    // Player menu preferences
-    private readonly Dictionary<ulong, float> _playerStepSizes = new();
-    private static readonly float[] AvailableSteps = [1f, 5f, 15f, 45f, 90f];
+    private sealed class PendingChatPrompt
+    {
+        public ulong SteamId;
+        public ChatPromptKind Kind;
+        public string TargetName = "";
+        public Vector Position;
+        public QAngle Angles;
+    }
+
+    // Unified pending chat prompt per player slot (prevents multi-prompt collisions and cleans up on disconnect)
+    private readonly Dictionary<int, PendingChatPrompt> _pendingChatBySlot = new();
+
+    // Player menu preferences (keyed by slot for reliable disconnect cleanup)
+    private readonly Dictionary<int, float> _playerStepSizes = new();
+    private readonly Dictionary<int, Dictionary<string, int>> _menuCursorBySlot = new(); // remembers highlighted option per menu
+    private readonly Dictionary<int, string> _activeMenuKeyBySlot = new();
 
     // Rotating announcer runtime state: name -> (index, lastSwitchTime)
     private readonly Dictionary<string, (int Index, float LastSwitchTime)> _rotatingState = new(StringComparer.OrdinalIgnoreCase);
 
-    // Player buttons and interaction cooldowns
+    // Player buttons and interaction cooldowns (keyed by slot)
     private readonly Dictionary<int, GameButtonFlags> _lastPlayerButtons = new();
-    private readonly Dictionary<ulong, float> _playerInteractionCooldowns = new();
+    private readonly Dictionary<int, float> _playerInteractionCooldowns = new();
 
     private float _lastDynamicUpdateTime;
     private float _lastRainbowUpdateTime;
-
-    private sealed class PendingCreation
-    {
-        public string Name = "";
-        public Vector Position;
-        public QAngle Angles;
-    }
 
     private sealed class CaptureSession
     {
@@ -105,27 +118,70 @@ public class WallTextModule
 
         _core.Event.OnTick += OnTick;
         _core.Event.OnClientDisconnected += OnClientDisconnected;
+        _mapContext.MapChanged += OnMapChanged;
+        _isRegistered = true;
 
-        _mapContext.MapChanged += ReloadForCurrentMap;
-        ReloadForCurrentMap();
+        _core.Scheduler.NextTick(() =>
+        {
+            _mapContext.RefreshFromEngine();
+            if (!IsUnknownMap(_mapContext.CurrentMap))
+            {
+                ReloadForCurrentMap();
+            }
+        });
     }
 
     public void Unload()
     {
-        if (!_config.Enabled)
+        if (_isRegistered)
         {
-            return;
+            _core.Command.UnregisterCommand(_commandGuid);
+            _core.Command.UnhookClientChat(_chatHookGuid);
+            _core.GameEvent.Unhook(_roundStartHookGuid);
+
+            _core.Event.OnTick -= OnTick;
+            _core.Event.OnClientDisconnected -= OnClientDisconnected;
+            _mapContext.MapChanged -= OnMapChanged;
+            _isRegistered = false;
         }
 
-        _core.Command.UnregisterCommand(_commandGuid);
-        _core.Command.UnhookClientChat(_chatHookGuid);
-        _core.GameEvent.Unhook(_roundStartHookGuid);
-
-        _core.Event.OnTick -= OnTick;
-        _core.Event.OnClientDisconnected -= OnClientDisconnected;
-        _mapContext.MapChanged -= ReloadForCurrentMap;
-
+        CloseAllMenus();
         ClearAllEntities();
+        _pendingChatBySlot.Clear();
+        _captureSessions.Clear();
+        _lastPlayerButtons.Clear();
+        _playerInteractionCooldowns.Clear();
+        _playerStepSizes.Clear();
+        _menuCursorBySlot.Clear();
+        _activeMenuKeyBySlot.Clear();
+    }
+
+    private void OnMapChanged()
+    {
+        // All entities from the previous map are already gone - just forget the handles
+        // (never try to Despawn them, their indices may belong to new map entities).
+        _liveEntities.Clear();
+        _core.Scheduler.NextTick(ReloadForCurrentMap);
+
+        // OnMapLoad fires very early; entities created before the map finishes spawning can be
+        // wiped. Re-check shortly after so texts are guaranteed to exist once the map is ready.
+        _core.Scheduler.DelayBySeconds(1.0f, RecheckLiveEntities);
+        _core.Scheduler.DelayBySeconds(3.0f, RecheckLiveEntities);
+    }
+
+    private static bool IsUnknownMap(string? mapName) =>
+        string.IsNullOrWhiteSpace(mapName) || string.Equals(mapName, "unknown", StringComparison.OrdinalIgnoreCase);
+
+    private float SafeCurrentTime()
+    {
+        try
+        {
+            return _core.Engine.GlobalVars.CurrentTime;
+        }
+        catch
+        {
+            return 0f;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -185,6 +241,26 @@ public class WallTextModule
         _store.Clear();
         _dynamicTextRenderCache.Clear();
         _rotatingState.Clear();
+        _captureSessions.Clear();
+        _pendingChatBySlot.Clear();
+        _lastPlayerButtons.Clear();
+        _playerInteractionCooldowns.Clear();
+        _lastDynamicUpdateTime = 0f;
+        _lastRainbowUpdateTime = 0f;
+
+        if (!_config.Enabled)
+        {
+            return;
+        }
+
+        if (IsUnknownMap(_mapContext.CurrentMap))
+        {
+            _mapContext.RefreshFromEngine();
+            if (IsUnknownMap(_mapContext.CurrentMap))
+            {
+                return;
+            }
+        }
 
         try
         {
@@ -197,6 +273,10 @@ public class WallTextModule
                 {
                     foreach (var kv in loaded)
                     {
+                        if (string.IsNullOrWhiteSpace(kv.Value.Name))
+                        {
+                            kv.Value.Name = kv.Key;
+                        }
                         _store[kv.Key] = kv.Value;
                     }
                 }
@@ -215,6 +295,11 @@ public class WallTextModule
 
     private void Save()
     {
+        if (IsUnknownMap(_mapContext.CurrentMap))
+        {
+            return;
+        }
+
         try
         {
             Directory.CreateDirectory(MapDirectory);
@@ -239,27 +324,77 @@ public class WallTextModule
     }
 
     // ------------------------------------------------------------------
-    // Math & Angle Helpers (Fixing tilted/horizontal text)
+    // Math & Angle Helpers
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// Calculates a perfectly upright facing angle for a wall text.
-    /// If placed on a vertical or near-vertical wall, locks Pitch and Roll to 0
-    /// so the text is guaranteed to stand upright and never lie horizontal.
+    /// Normalizes an angle in degrees into the [-180, 180) range.
+    /// </summary>
+    private static float NormalizeAngle(float angle)
+    {
+        angle %= 360f;
+        if (angle >= 180f) angle -= 360f;
+        else if (angle < -180f) angle += 360f;
+        return MathF.Abs(angle) < 0.001f ? 0f : angle;
+    }
+
+    /// <summary>
+    /// Calculates a readable facing angle for a wall text from a surface normal.
+    /// <para>
+    /// IMPORTANT: <c>point_worldtext</c> renders its text in the entity's local X/Y plane
+    /// (reading direction = +X, glyph "up" = +Y, visible face = +Z). With angles (0, yaw, 0)
+    /// the text therefore lies flat and - when yaw follows the wall normal - sticks out of the
+    /// wall like a bullet. To stand it on a wall facing the viewer we must use
+    /// yaw = normalYaw + 90 (reading direction runs along the wall to the viewer's right) and
+    /// roll = 90 - elevation (rolls the face out of the wall; floor = 0, wall = 90, ceiling = 180).
+    /// </para>
     /// </summary>
     private static QAngle CalculateWallAngles(Vector normal, QAngle playerEyeAngles)
     {
-        // If vertical or slanted wall surface (majority of cases)
-        if (MathF.Abs(normal.Z) < 0.7f)
+        float lenSq = normal.X * normal.X + normal.Y * normal.Y + normal.Z * normal.Z;
+        if (lenSq > 0.0001f)
         {
-            // Yaw pointing outward perpendicular from the wall surface
-            float yaw = MathF.Atan2(normal.Y, normal.X) * (180f / MathF.PI);
-            return new QAngle(0f, yaw, 0f);
+            float invLen = 1f / MathF.Sqrt(lenSq);
+            normal = new Vector(normal.X * invLen, normal.Y * invLen, normal.Z * invLen);
+        }
+        else
+        {
+            float eyeYawRad = playerEyeAngles.Yaw * (MathF.PI / 180f);
+            normal = new Vector(-MathF.Cos(eyeYawRad), -MathF.Sin(eyeYawRad), 0f);
         }
 
-        // Flat floor (Z > 0) or ceiling (Z < 0)
-        float pitch = normal.Z > 0 ? -90f : 90f;
-        return new QAngle(pitch, playerEyeAngles.Yaw, 0f);
+        // Vertical or slanted wall: keep text perfectly upright on (near) vertical walls
+        if (MathF.Abs(normal.Z) < 0.7f)
+        {
+            float normalYaw = MathF.Atan2(normal.Y, normal.X) * (180f / MathF.PI);
+            float elevation = MathF.Abs(normal.Z) < 0.15f ? 0f : MathF.Asin(normal.Z) * (180f / MathF.PI);
+            return new QAngle(0f, NormalizeAngle(normalYaw + 90f), NormalizeAngle(90f - elevation));
+        }
+
+        // Floor (face up, roll 0) or ceiling (face down, roll 180):
+        // text top points away from the player so it reads naturally while looking at it.
+        float yaw = NormalizeAngle(playerEyeAngles.Yaw - 90f);
+        return new QAngle(0f, yaw, normal.Z > 0 ? 0f : 180f);
+    }
+
+    /// <summary>Horizontal direction (yaw, degrees) the visible face of the text points to.</summary>
+    private static float FaceYaw(WallTextData data) => NormalizeAngle(data.Angles[1] - 90f);
+
+    /// <summary>
+    /// Builds point_worldtext angles whose visible face points along (dx, dy, dz).
+    /// See <see cref="CalculateWallAngles"/> for the axis convention.
+    /// </summary>
+    private static (float Pitch, float Yaw, float Roll) AnglesFacingDirection(float dx, float dy, float dz, bool keepUpright)
+    {
+        float horiz = MathF.Sqrt(dx * dx + dy * dy);
+        if (horiz < 0.001f)
+        {
+            return (0f, 0f, dz >= 0 ? 0f : 180f);
+        }
+
+        float dirYaw = MathF.Atan2(dy, dx) * (180f / MathF.PI);
+        float elevation = keepUpright ? 0f : MathF.Atan2(dz, horiz) * (180f / MathF.PI);
+        return (0f, NormalizeAngle(dirYaw + 90f), NormalizeAngle(90f - elevation));
     }
 
     private static bool IsValidTransform(float[] position, float[] angles)
@@ -290,7 +425,7 @@ public class WallTextModule
     {
         if (string.IsNullOrWhiteSpace(hex)) return "#FFFFFF";
         hex = hex.Trim();
-        return hex.StartsWith('#') ? hex : "#" + hex;
+        return hex.StartsWith('#') ? hex.ToUpperInvariant() : "#" + hex.ToUpperInvariant();
     }
 
     private static bool IsValidHex(string? hex)
@@ -302,6 +437,7 @@ public class WallTextModule
 
     private static Color ColorFromHsv(float hue, float saturation, float value)
     {
+        hue = ((hue % 360f) + 360f) % 360f;
         int hi = (int)MathF.Floor(hue / 60f) % 6;
         float f = (hue / 60f) - MathF.Floor(hue / 60f);
 
@@ -348,35 +484,17 @@ public class WallTextModule
                 return;
             }
 
-            string initialText = data.Text;
-            if (data.IsRotating && data.RotatingMessages.Count > 0)
-            {
-                initialText = data.RotatingMessages[0];
-                _rotatingState[data.Name] = (0, _core.Engine.GlobalVars.CurrentTime);
-            }
-
+            string initialText = GetActiveTemplateText(data, resetRotationTimer: true);
             var formattedText = WallTextPlaceholders.Format(initialText, _core, _mapContext.CurrentMap);
-            entity.MessageText = formattedText;
-            entity.Color = Color.FromHex(NormalizeHex(data.ColorHex));
-            entity.FontSize = data.FontSize;
-            entity.WorldUnitsPerPx = data.Scale;
-            entity.Fullbright = data.Fullbright;
-            entity.Enabled = true;
-            entity.DrawBackground = data.Background;
-            entity.JustifyHorizontal = (PointWorldTextJustifyHorizontal_t)Math.Clamp(data.JustifyHorizontal, 0, 2);
-            entity.JustifyVertical = PointWorldTextJustifyVertical_t.POINT_WORLD_TEXT_JUSTIFY_VERTICAL_CENTER;
-            entity.ReorientMode = data.FacePlayer
-                ? PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_AROUND_UP
-                : PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_NONE;
-            entity.DepthOffset = data.DepthOffset;
 
+            ApplyEntityProperties(entity, data, formattedText, notifyNetwork: false);
             entity.DispatchSpawn();
 
             var pos = new Vector(data.Position[0], data.Position[1], data.Position[2]);
             var ang = new QAngle(data.Angles[0], data.Angles[1], data.Angles[2]);
             entity.Teleport(pos, ang, new Vector(0f, 0f, 0f));
 
-            _liveEntities[data.Name] = entity;
+            _liveEntities[data.Name] = _core.EntitySystem.GetRefEHandle(entity);
             _dynamicTextRenderCache[data.Name] = formattedText;
         }
         catch (Exception ex)
@@ -385,17 +503,93 @@ public class WallTextModule
         }
     }
 
+    private string GetActiveTemplateText(WallTextData data, bool resetRotationTimer = false)
+    {
+        if (data.IsRotating && data.RotatingMessages.Count > 0)
+        {
+            if (resetRotationTimer || !_rotatingState.TryGetValue(data.Name, out var rState) || rState.Index < 0 || rState.Index >= data.RotatingMessages.Count)
+            {
+                rState = (0, SafeCurrentTime());
+                _rotatingState[data.Name] = rState;
+            }
+            return data.RotatingMessages[rState.Index];
+        }
+        return data.Text;
+    }
+
+    private static void ApplyEntityProperties(CPointWorldText entity, WallTextData data, string formattedText, bool notifyNetwork)
+    {
+        entity.MessageText = formattedText;
+        if (!string.IsNullOrWhiteSpace(data.FontName))
+        {
+            entity.FontName = data.FontName;
+        }
+        else
+        {
+            entity.FontName = "";
+        }
+
+        entity.FontSize = data.FontSize;
+        entity.WorldUnitsPerPx = data.Scale;
+        if (!data.Rainbow)
+        {
+            entity.Color = Color.FromHex(NormalizeHex(data.ColorHex));
+        }
+        entity.Enabled = true;
+        entity.Fullbright = data.Fullbright;
+        entity.DrawBackground = data.Background;
+        if (data.Background)
+        {
+            entity.BackgroundBorderWidth = 0.2f;
+            entity.BackgroundBorderHeight = 0.2f;
+            entity.BackgroundWorldToUV = 0.05f;
+        }
+        entity.JustifyHorizontal = (PointWorldTextJustifyHorizontal_t)Math.Clamp(data.JustifyHorizontal, 0, 2);
+        entity.JustifyVertical = (PointWorldTextJustifyVertical_t)Math.Clamp(data.JustifyVertical, 0, 2);
+        entity.ReorientMode = data.FacePlayer
+            ? PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_AROUND_UP
+            : PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_NONE;
+        entity.DepthOffset = data.DepthOffset;
+
+        if (notifyNetwork)
+        {
+            entity.MessageTextUpdated();
+            entity.FontNameUpdated();
+            entity.FontSizeUpdated();
+            entity.WorldUnitsPerPxUpdated();
+            if (!data.Rainbow)
+            {
+                entity.ColorUpdated();
+            }
+            entity.EnabledUpdated();
+            entity.FullbrightUpdated();
+            entity.DrawBackgroundUpdated();
+            if (data.Background)
+            {
+                entity.BackgroundBorderWidthUpdated();
+                entity.BackgroundBorderHeightUpdated();
+                entity.BackgroundWorldToUVUpdated();
+            }
+            entity.JustifyHorizontalUpdated();
+            entity.JustifyVerticalUpdated();
+            entity.ReorientModeUpdated();
+            entity.DepthOffsetUpdated();
+        }
+    }
+
     private void DespawnEntity(string name)
     {
         _dynamicTextRenderCache.Remove(name);
         _rotatingState.Remove(name);
-        if (_liveEntities.Remove(name, out var entity))
+        if (_liveEntities.Remove(name, out var handle))
         {
             try
             {
-                if (((CEntityInstance)entity).IsValid)
+                // Handle validity checks index + serial, so we never delete an unrelated entity
+                // that reused the index after a round/map cleanup.
+                if (handle.IsValid)
                 {
-                    entity.Despawn();
+                    handle.Value?.Despawn();
                 }
             }
             catch
@@ -403,6 +597,30 @@ public class WallTextModule
                 // Entity already cleaned up
             }
         }
+    }
+
+    private bool TryGetLiveEntity(string name, out CPointWorldText entity)
+    {
+        entity = null!;
+        if (!_liveEntities.TryGetValue(name, out var handle))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (handle.IsValid && handle.Value is { } value && value.IsValid)
+            {
+                entity = value;
+                return true;
+            }
+        }
+        catch
+        {
+            // Stale handle
+        }
+
+        return false;
     }
 
     private void ClearAllEntities()
@@ -417,12 +635,15 @@ public class WallTextModule
 
     private void UpdateLiveEntity(WallTextData data)
     {
-        if (!_liveEntities.TryGetValue(data.Name, out var entity) || entity == null || !((CEntityInstance)entity).IsValid)
+        if (!data.Enabled)
         {
-            if (data.Enabled)
-            {
-                SpawnEntity(data);
-            }
+            DespawnEntity(data.Name);
+            return;
+        }
+
+        if (!TryGetLiveEntity(data.Name, out var entity))
+        {
+            SpawnEntity(data);
             return;
         }
 
@@ -438,43 +659,11 @@ public class WallTextModule
             var ang = new QAngle(data.Angles[0], data.Angles[1], data.Angles[2]);
             entity.Teleport(pos, ang, new Vector(0f, 0f, 0f));
 
-            string textToShow = data.Text;
-            if (data.IsRotating && data.RotatingMessages.Count > 0)
-            {
-                if (!_rotatingState.TryGetValue(data.Name, out var rState) || rState.Index >= data.RotatingMessages.Count)
-                {
-                    rState = (0, _core.Engine.GlobalVars.CurrentTime);
-                    _rotatingState[data.Name] = rState;
-                }
-                textToShow = data.RotatingMessages[rState.Index];
-            }
-
+            string textToShow = GetActiveTemplateText(data);
             var formattedText = WallTextPlaceholders.Format(textToShow, _core, _mapContext.CurrentMap);
-            entity.MessageText = formattedText;
-            entity.MessageTextUpdated();
-            _dynamicTextRenderCache[data.Name] = formattedText;
 
-            entity.FontSize = data.FontSize;
-            entity.FontSizeUpdated();
-            entity.WorldUnitsPerPx = data.Scale;
-            entity.WorldUnitsPerPxUpdated();
-            if (!data.Rainbow)
-            {
-                entity.Color = Color.FromHex(NormalizeHex(data.ColorHex));
-                entity.ColorUpdated();
-            }
-            entity.DrawBackground = data.Background;
-            entity.DrawBackgroundUpdated();
-            entity.Fullbright = data.Fullbright;
-            entity.FullbrightUpdated();
-            entity.JustifyHorizontal = (PointWorldTextJustifyHorizontal_t)Math.Clamp(data.JustifyHorizontal, 0, 2);
-            entity.JustifyHorizontalUpdated();
-            entity.ReorientMode = data.FacePlayer
-                ? PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_AROUND_UP
-                : PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_NONE;
-            entity.ReorientModeUpdated();
-            entity.DepthOffset = data.DepthOffset;
-            entity.DepthOffsetUpdated();
+            ApplyEntityProperties(entity, data, formattedText, notifyNetwork: true);
+            _dynamicTextRenderCache[data.Name] = formattedText;
         }
         catch (Exception ex)
         {
@@ -484,17 +673,22 @@ public class WallTextModule
 
     private HookResult OnRoundStart(EventRoundStart @event)
     {
+        // Round restart (mp_restartgame / new round) runs a map cleanup that deletes
+        // point_worldtext entities created by plugins. Respawn any missing texts.
         _core.Scheduler.NextTick(RecheckLiveEntities);
+        _core.Scheduler.DelayBySeconds(0.5f, RecheckLiveEntities);
         return HookResult.Continue;
     }
 
     private void RecheckLiveEntities()
     {
+        if (!_config.Enabled) return;
+
         foreach (var data in _store.Values)
         {
             if (!data.Enabled) continue;
 
-            if (!_liveEntities.TryGetValue(data.Name, out var entity) || entity == null || !((CEntityInstance)entity).IsValid)
+            if (!TryGetLiveEntity(data.Name, out var entity))
             {
                 SpawnEntity(data);
             }
@@ -507,25 +701,37 @@ public class WallTextModule
 
     private void OnTick()
     {
-        var now = _core.Engine.GlobalVars.CurrentTime;
+        if (!_config.Enabled) return;
+
+        var now = SafeCurrentTime();
 
         UpdateRainbowColors(now);
         UpdateRotatingAnnouncers(now);
         UpdateDynamicPlaceholders(now);
         ProcessAimCaptures(now);
         CheckPlayerInteractions(now);
+
+        // Watchdog: if any cleanup (round restart, mp_restartgame, other plugins) removed a text,
+        // bring it back within ~2 seconds even if no round_start event fired.
+        if (now < _lastWatchdogTime || now - _lastWatchdogTime >= 2f)
+        {
+            _lastWatchdogTime = now;
+            RecheckLiveEntities();
+        }
     }
+
+    private float _lastWatchdogTime;
 
     private void UpdateRainbowColors(float now)
     {
-        // 10 Hz update rate for silky smooth RGB cycle without flooding network
-        if (now - _lastRainbowUpdateTime < 0.1f) return;
+        // Guard against GlobalVars.CurrentTime rollback on map transitions
+        if (now >= _lastRainbowUpdateTime && now - _lastRainbowUpdateTime < 0.1f) return;
         _lastRainbowUpdateTime = now;
 
         foreach (var data in _store.Values)
         {
             if (!data.Enabled || !data.Rainbow) continue;
-            if (!_liveEntities.TryGetValue(data.Name, out var entity) || entity == null || !((CEntityInstance)entity).IsValid) continue;
+            if (!TryGetLiveEntity(data.Name, out var entity)) continue;
 
             float hue = (now * 60f * data.RainbowSpeed) % 360f;
             entity.Color = ColorFromHsv(hue, 1f, 1f);
@@ -538,9 +744,9 @@ public class WallTextModule
         foreach (var data in _store.Values)
         {
             if (!data.Enabled || !data.IsRotating || data.RotatingMessages.Count == 0) continue;
-            if (!_liveEntities.TryGetValue(data.Name, out var entity) || entity == null || !((CEntityInstance)entity).IsValid) continue;
+            if (!TryGetLiveEntity(data.Name, out var entity)) continue;
 
-            if (!_rotatingState.TryGetValue(data.Name, out var state))
+            if (!_rotatingState.TryGetValue(data.Name, out var state) || now < state.LastSwitchTime)
             {
                 state = (0, now);
                 _rotatingState[data.Name] = state;
@@ -564,16 +770,18 @@ public class WallTextModule
     private void UpdateDynamicPlaceholders(float now)
     {
         if (_config.DynamicUpdateIntervalSeconds <= 0f) return;
-        if (now - _lastDynamicUpdateTime < _config.DynamicUpdateIntervalSeconds) return;
+        if (now >= _lastDynamicUpdateTime && now - _lastDynamicUpdateTime < _config.DynamicUpdateIntervalSeconds) return;
         _lastDynamicUpdateTime = now;
 
         foreach (var data in _store.Values)
         {
-            if (!data.Enabled || data.IsRotating) continue;
-            if (!WallTextPlaceholders.HasPlaceholders(data.Text)) continue;
-            if (!_liveEntities.TryGetValue(data.Name, out var entity) || entity == null || !((CEntityInstance)entity).IsValid) continue;
+            if (!data.Enabled) continue;
 
-            var rendered = WallTextPlaceholders.Format(data.Text, _core, _mapContext.CurrentMap);
+            string activeTemplate = GetActiveTemplateText(data);
+            if (!WallTextPlaceholders.HasPlaceholders(activeTemplate)) continue;
+            if (!TryGetLiveEntity(data.Name, out var entity)) continue;
+
+            var rendered = WallTextPlaceholders.Format(activeTemplate, _core, _mapContext.CurrentMap);
             if (_dynamicTextRenderCache.TryGetValue(data.Name, out var cached) && cached == rendered) continue;
 
             try
@@ -611,7 +819,7 @@ public class WallTextModule
         {
             if (player == null || !player.IsValid || player.IsFakeClient) continue;
             var pawn = player.PlayerPawn;
-            if (pawn == null || pawn.Health <= 0) continue;
+            if (pawn == null || !pawn.IsValid || pawn.Health <= 0) continue;
 
             var currentButtons = player.PressedButtons;
             _lastPlayerButtons.TryGetValue(player.Slot, out var lastButtons);
@@ -627,57 +835,89 @@ public class WallTextModule
             if (!pawn.AbsOrigin.HasValue) continue;
             var playerPos = pawn.AbsOrigin.Value;
 
+            // Find the closest matching interactable text to the aimed hitPoint
+            WallTextData? bestMatch = null;
+            float bestHitDist = float.MaxValue;
+
             foreach (var data in _store.Values)
             {
                 if (!data.Enabled || !data.IsInteractable) continue;
 
-                // Match trigger filter
                 if (data.TriggerType.Equals("use", StringComparison.OrdinalIgnoreCase) && !useRising) continue;
                 if (data.TriggerType.Equals("shoot", StringComparison.OrdinalIgnoreCase) && !shootRising) continue;
 
                 var textPos = new Vector(data.Position[0], data.Position[1], data.Position[2]);
 
-                // Check player distance to text
                 float distToPlayer = VectorDistance(playerPos, textPos);
                 if (distToPlayer > data.InteractionDistance) continue;
 
-                // Check hit radius on the wall text surface
-                float hitRadius = MathF.Max(60f, data.FontSize * data.Scale * 8f);
+                float hitRadius = Math.Clamp(data.FontSize * data.Scale * 6f, 45f, 180f);
                 float distToHit = VectorDistance(hitPoint, textPos);
-                if (distToHit > hitRadius) continue;
-
-                // Check anti-spam cooldown
-                if (_playerInteractionCooldowns.TryGetValue(player.SteamID, out var lastTime) && (now - lastTime < data.CooldownSeconds))
+                if (distToHit <= hitRadius && distToHit < bestHitDist)
                 {
-                    continue;
+                    bestHitDist = distToHit;
+                    bestMatch = data;
                 }
-                _playerInteractionCooldowns[player.SteamID] = now;
+            }
 
-                // Fire tactile feedback sound to player
-                player.ExecuteCommand("play sounds/ui/beepclear.vsnd");
+            if (bestMatch == null) continue;
 
-                // Send chat message to player if configured
-                if (!string.IsNullOrWhiteSpace(data.MessageToPlayer))
-                {
-                    var msg = WallTextPlaceholders.Format(data.MessageToPlayer, _core, _mapContext.CurrentMap, player);
-                    player.SendChat($"{Prefix()} {msg}");
-                }
+            if (_playerInteractionCooldowns.TryGetValue(player.Slot, out var lastTime)
+                && now >= lastTime
+                && (now - lastTime < bestMatch.CooldownSeconds))
+            {
+                continue;
+            }
+            _playerInteractionCooldowns[player.Slot] = now;
 
-                // Run configured command
-                if (!string.IsNullOrWhiteSpace(data.CommandToRun))
-                {
-                    var cmd = WallTextPlaceholders.Format(data.CommandToRun, _core, _mapContext.CurrentMap, player);
-                    if (cmd.StartsWith("server:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        _core.Engine.ExecuteCommand(cmd[7..].Trim());
-                    }
-                    else
-                    {
-                        player.ExecuteCommand(cmd);
-                    }
-                }
+            // Fire tactile feedback sound to player
+            player.ExecuteCommand("play sounds/ui/beepclear.vsnd");
 
-                break; // Trigger closest text
+            // Send chat message to player if configured
+            if (!string.IsNullOrWhiteSpace(bestMatch.MessageToPlayer))
+            {
+                var msg = WallTextPlaceholders.Format(bestMatch.MessageToPlayer, _core, _mapContext.CurrentMap, player);
+                SendColoredChat(player, $"{Prefix()} {msg}");
+            }
+
+            // Run configured command(s)
+            if (!string.IsNullOrWhiteSpace(bestMatch.CommandToRun))
+            {
+                var rawCmd = WallTextPlaceholders.Format(bestMatch.CommandToRun, _core, _mapContext.CurrentMap, player);
+                ExecuteTriggerCommands(player, rawCmd);
+            }
+        }
+    }
+
+    private void ExecuteTriggerCommands(IPlayer player, string rawCmd)
+    {
+        bool isServerCmd = false;
+        if (rawCmd.StartsWith("server:", StringComparison.OrdinalIgnoreCase))
+        {
+            isServerCmd = true;
+            rawCmd = rawCmd[7..].Trim();
+        }
+
+        foreach (var part in rawCmd.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (string.IsNullOrWhiteSpace(part)) continue;
+
+            if (isServerCmd)
+            {
+                _core.Engine.ExecuteCommand(part);
+            }
+            else if (part.StartsWith("server:", StringComparison.OrdinalIgnoreCase))
+            {
+                _core.Engine.ExecuteCommand(part[7..].Trim());
+            }
+            else if (part.StartsWith('!') || part.StartsWith('/'))
+            {
+                // Convert chat command shorthand (!vip) into client say command
+                player.ExecuteCommand($"say \"{part}\"");
+            }
+            else
+            {
+                player.ExecuteCommand(part);
             }
         }
     }
@@ -708,14 +948,14 @@ public class WallTextModule
             }
 
             var pawn = player.PlayerPawn;
-            if (pawn == null || pawn.Health <= 0) continue;
+            if (pawn == null || !pawn.IsValid || pawn.Health <= 0) continue;
 
             var pressed = (player.PressedButtons & GameButtonFlags.Mouse1) != 0;
             var risingEdge = pressed && !session.LastMouse1Down;
             session.LastMouse1Down = pressed;
 
             if (!risingEdge) continue;
-            if (now - session.LastCaptureTime < CaptureDebounceSeconds) continue;
+            if (now >= session.LastCaptureTime && now - session.LastCaptureTime < CaptureDebounceSeconds) continue;
 
             if (!TryTraceAimPoint(pawn, out var point, out var normal)) continue;
 
@@ -725,12 +965,12 @@ public class WallTextModule
         }
     }
 
-    private void MoveToCrosshair(IPlayer player, string name)
+    private void MoveToCrosshair(IPlayer player, string name, bool returnToOrientationMenu = false)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return;
         }
 
@@ -750,8 +990,12 @@ public class WallTextModule
         Save();
         UpdateLiveEntity(data);
 
-        player.SendChat($"{Prefix()} {T("chat.moved_to_crosshair", data.Name)}");
-        _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
+        SendColoredChat(player, $"{Prefix()} {T("chat.moved_to_crosshair", data.Name)}");
+        _core.Scheduler.NextTick(() =>
+        {
+            if (returnToOrientationMenu) OpenOrientationMenu(player, data.Name);
+            else OpenDetailMenu(player, data.Name);
+        });
     }
 
     private bool TryTraceAimPoint(CCSPlayerPawn pawn, out Vector point, out Vector normal)
@@ -759,35 +1003,126 @@ public class WallTextModule
         point = default;
         normal = new Vector(0f, 0f, 1f);
 
-        Vector start;
-        if (pawn.EyePosition.HasValue)
-        {
-            start = pawn.EyePosition.Value;
-        }
-        else if (pawn.AbsOrigin.HasValue)
-        {
-            start = new Vector(pawn.AbsOrigin.Value.X, pawn.AbsOrigin.Value.Y, pawn.AbsOrigin.Value.Z + 64f);
-        }
-        else
-        {
-            return false;
-        }
+        if (pawn == null || !pawn.IsValid) return false;
+        if (!TryGetEyePosition(pawn, out var start)) return false;
 
         var angles = pawn.EyeAngles;
 
-        var trace = _core.Trace.TraceShapeAngle(start, angles, 8192f, new TraceParams
-        {
-            EntitiesToIgnore = [pawn]
-        });
+        TraceParams? traceParams = TraceParams.Builder()
+            .WithLineRay()
+            .WithObjectQuery(RnQueryObjectSet.All)
+            .WithInteraction(
+                MaskTrace.WorldGeometry | MaskTrace.StaticLevel | MaskTrace.CsgoOpaque |
+                MaskTrace.PhysicsProp | MaskTrace.PlayerClip | MaskTrace.Window | MaskTrace.Solid,
+                MaskTrace.Empty,
+                MaskTrace.Empty)
+            .WithCollisionGroup(CollisionGroup.Player)
+            .HitSolid(true)
+            .HitTrigger(false)
+            .IgnoreEntity(pawn)
+            .IgnoreOwner(pawn)
+            .Build();
 
+        var trace = _core.Trace.TraceShapeAngle(in start, in angles, 8192f, in traceParams);
         if (!trace.DidHit)
         {
-            return false;
+            TraceParams? fallbackParams = TraceParams.Builder()
+                .WithLineRay()
+                .WithObjectQuery(RnQueryObjectSet.All)
+                .HitSolid(true)
+                .HitTrigger(false)
+                .IgnoreEntity(pawn)
+                .IgnoreOwner(pawn)
+                .Build();
+
+            trace = _core.Trace.TraceShapeAngle(in start, in angles, 8192f, in fallbackParams);
+            if (!trace.DidHit)
+            {
+                return false;
+            }
+        }
+
+        // If trace started inside or immediately hit player's own bbox/equipment, nudge forward along view ray
+        if (trace.StartInSolid || trace.Distance < 1.5f)
+        {
+            angles.ToDirectionVectors(out var forward, out _, out _);
+            var nudgedStart = new Vector(
+                start.X + forward.X * 20f,
+                start.Y + forward.Y * 20f,
+                start.Z + forward.Z * 20f);
+
+            var retry = _core.Trace.TraceShapeAngle(in nudgedStart, in angles, 8192f, in traceParams);
+            if (retry.DidHit && !retry.StartInSolid)
+            {
+                trace = retry;
+            }
         }
 
         point = trace.HitPoint;
         normal = trace.HitNormal;
+
+        float normLenSq = normal.X * normal.X + normal.Y * normal.Y + normal.Z * normal.Z;
+        if (normLenSq < 0.001f)
+        {
+            float yawRad = angles.Yaw * (MathF.PI / 180f);
+            normal = new Vector(-MathF.Cos(yawRad), -MathF.Sin(yawRad), 0f);
+        }
+
         return true;
+    }
+
+    private static bool TryGetEyePosition(CCSPlayerPawn pawn, out Vector eyePos)
+    {
+        eyePos = default;
+        try
+        {
+            if (pawn.AbsOrigin.HasValue)
+            {
+                var origin = pawn.AbsOrigin.Value;
+                float viewZ = 64f;
+                try
+                {
+                    var zOffset = pawn.ViewOffset.Z.Value;
+                    if (zOffset >= 16f && zOffset <= 96f)
+                    {
+                        viewZ = zOffset;
+                    }
+                }
+                catch
+                {
+                    // Fallback to 64f
+                }
+
+                // Only use pawn.EyePosition if it is in valid world-space proximity to AbsOrigin
+                if (pawn.EyePosition.HasValue)
+                {
+                    var ep = pawn.EyePosition.Value;
+                    float dx = MathF.Abs(ep.X - origin.X);
+                    float dy = MathF.Abs(ep.Y - origin.Y);
+                    float dz = ep.Z - origin.Z;
+                    if (dx < 32f && dy < 32f && dz >= 16f && dz <= 96f)
+                    {
+                        eyePos = ep;
+                        return true;
+                    }
+                }
+
+                eyePos = new Vector(origin.X, origin.Y, origin.Z + viewZ);
+                return true;
+            }
+
+            if (pawn.EyePosition.HasValue)
+            {
+                eyePos = pawn.EyePosition.Value;
+                return true;
+            }
+        }
+        catch
+        {
+            // Ignore schema access error
+        }
+
+        return false;
     }
 
     private void BeginPointCapture(IPlayer player, Action<IPlayer, Vector, Vector> onCaptured)
@@ -796,30 +1131,35 @@ public class WallTextModule
         {
             OnCaptured = onCaptured,
             LastMouse1Down = (player.PressedButtons & GameButtonFlags.Mouse1) != 0,
+            LastCaptureTime = SafeCurrentTime(),
         };
     }
 
     private bool IsCapturing(int slot) => _captureSessions.ContainsKey(slot);
+
+    private void SetPendingChat(IPlayer player, ChatPromptKind kind, string targetName, Vector position = default, QAngle angles = default)
+    {
+        CloseMenu(player);
+        _pendingChatBySlot[player.Slot] = new PendingChatPrompt
+        {
+            SteamId = player.SteamID,
+            Kind = kind,
+            TargetName = targetName,
+            Position = position,
+            Angles = angles
+        };
+    }
 
     private void OnClientDisconnected(IOnClientDisconnectedEvent @event)
     {
         var slot = @event.PlayerId;
         _captureSessions.Remove(slot);
         _lastPlayerButtons.Remove(slot);
-
-        var player = _core.PlayerManager.GetPlayer(slot);
-        if (player != null && player.IsValid)
-        {
-            _pendingNewText.Remove(player.SteamID);
-            _pendingTextChange.Remove(player.SteamID);
-            _pendingRename.Remove(player.SteamID);
-            _pendingColorChange.Remove(player.SteamID);
-            _pendingAddRotatingMsg.Remove(player.SteamID);
-            _pendingInteractMsg.Remove(player.SteamID);
-            _pendingInteractCmd.Remove(player.SteamID);
-            _playerStepSizes.Remove(player.SteamID);
-            _playerInteractionCooldowns.Remove(player.SteamID);
-        }
+        _pendingChatBySlot.Remove(slot);
+        _playerStepSizes.Remove(slot);
+        _menuCursorBySlot.Remove(slot);
+        _activeMenuKeyBySlot.Remove(slot);
+        _playerInteractionCooldowns.Remove(slot);
     }
 
     // ------------------------------------------------------------------
@@ -837,7 +1177,7 @@ public class WallTextModule
 
         if (!HasPermission(player))
         {
-            player.SendChat($"{Prefix()} {T("chat.no_permission")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.no_permission")}");
             return;
         }
 
@@ -854,7 +1194,7 @@ public class WallTextModule
             {
                 if (args.Length < 2)
                 {
-                    player.SendChat($"{Prefix()} {T("chat.usage_add")}");
+                    SendColoredChat(player, $"{Prefix()} {T("chat.usage_add")}");
                     return;
                 }
                 BeginCreate(player, string.Join(" ", args, 1, args.Length - 1));
@@ -864,7 +1204,7 @@ public class WallTextModule
             {
                 if (args.Length < 2)
                 {
-                    player.SendChat($"{Prefix()} {T("chat.usage_edit_cmd")}");
+                    SendColoredChat(player, $"{Prefix()} {T("chat.usage_edit_cmd")}");
                     return;
                 }
                 BeginRename(player, string.Join(" ", args, 1, args.Length - 1));
@@ -874,7 +1214,7 @@ public class WallTextModule
             {
                 if (args.Length < 2)
                 {
-                    player.SendChat($"{Prefix()} {T("chat.usage_delete")}");
+                    SendColoredChat(player, $"{Prefix()} {T("chat.usage_delete")}");
                     return;
                 }
                 DeleteWallText(player, string.Join(" ", args, 1, args.Length - 1));
@@ -887,7 +1227,7 @@ public class WallTextModule
             {
                 if (args.Length < 2)
                 {
-                    player.SendChat($"{Prefix()} {T("chat.usage_tp")}");
+                    SendColoredChat(player, $"{Prefix()} {T("chat.usage_tp")}");
                     return;
                 }
                 TeleportToText(player, string.Join(" ", args, 1, args.Length - 1));
@@ -897,60 +1237,55 @@ public class WallTextModule
             {
                 LoadConfig();
                 ReloadForCurrentMap();
-                player.SendChat($"{Prefix()} {T("chat.reloaded", _mapContext.CurrentMap, _store.Count)}");
+                SendColoredChat(player, $"{Prefix()} {T("chat.reloaded", _mapContext.CurrentMap, _store.Count)}");
                 break;
             }
             case "help":
                 ShowHelp(player);
                 break;
             default:
-                player.SendChat($"{Prefix()} {T("chat.usage_general")}");
+                SendColoredChat(player, $"{Prefix()} {T("chat.usage_general")}");
                 break;
         }
     }
 
     private void ShowHelp(IPlayer player)
     {
-        player.SendChat(T("chat.help_header"));
-        player.SendChat(T("chat.help_menu"));
-        player.SendChat(T("chat.help_add"));
-        player.SendChat(T("chat.help_edit"));
-        player.SendChat(T("chat.help_delete"));
-        player.SendChat(T("chat.help_list"));
-        player.SendChat(T("chat.help_tp"));
-        player.SendChat(T("chat.help_reload"));
+        SendColoredChat(player, T("chat.help_header"));
+        SendColoredChat(player, T("chat.help_menu"));
+        SendColoredChat(player, T("chat.help_add"));
+        SendColoredChat(player, T("chat.help_edit"));
+        SendColoredChat(player, T("chat.help_delete"));
+        SendColoredChat(player, T("chat.help_list"));
+        SendColoredChat(player, T("chat.help_tp"));
+        SendColoredChat(player, T("chat.help_reload"));
     }
 
     private void BeginCreate(IPlayer player, string name)
     {
+        name = name.Trim();
         if (FindKey(name) != null)
         {
-            player.SendChat($"{Prefix()} {T("chat.already_exists", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.already_exists", name)}");
             return;
         }
 
         if (IsCapturing(player.Slot))
         {
-            player.SendChat($"{Prefix()} {T("chat.already_capturing")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.already_capturing")}");
             return;
         }
 
         CloseMenu(player);
-        player.SendChat($"{Prefix()} {T("chat.capturing_point", name)}");
+        SendColoredChat(player, $"{Prefix()} {T("chat.capturing_point", name)}");
 
         BeginPointCapture(player, (p, point, normal) =>
         {
             var placedPos = point + normal * WallOffset;
             var angle = CalculateWallAngles(normal, p.PlayerPawn?.EyeAngles ?? default);
 
-            _pendingNewText[p.SteamID] = new PendingCreation
-            {
-                Name = name,
-                Position = placedPos,
-                Angles = angle,
-            };
-
-            p.SendChat($"{Prefix()} {T("chat.enter_text")}");
+            SetPendingChat(p, ChatPromptKind.NewText, name, placedPos, angle);
+            SendColoredChat(p, $"{Prefix()} {T("chat.enter_text")}");
         });
     }
 
@@ -959,18 +1294,18 @@ public class WallTextModule
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return;
         }
 
         if (IsCapturing(player.Slot))
         {
-            player.SendChat($"{Prefix()} {T("chat.already_capturing")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.already_capturing")}");
             return;
         }
 
         CloseMenu(player);
-        player.SendChat($"{Prefix()} {T("chat.reaim_prompt", data.Name)}");
+        SendColoredChat(player, $"{Prefix()} {T("chat.reaim_prompt", data.Name)}");
 
         BeginPointCapture(player, (p, point, normal) =>
         {
@@ -982,7 +1317,7 @@ public class WallTextModule
             Save();
             UpdateLiveEntity(data);
 
-            p.SendChat($"{Prefix()} {T("chat.reaim_success", data.Name)}");
+            SendColoredChat(p, $"{Prefix()} {T("chat.reaim_success", data.Name)}");
             _core.Scheduler.NextTick(() => OpenDetailMenu(p, data.Name));
         });
     }
@@ -992,7 +1327,13 @@ public class WallTextModule
         var key = FindKey(sourceName);
         if (key == null || !_store.TryGetValue(key, out var source))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", sourceName)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", sourceName)}");
+            return;
+        }
+
+        if (IsCapturing(player.Slot))
+        {
+            SendColoredChat(player, $"{Prefix()} {T("chat.already_capturing")}");
             return;
         }
 
@@ -1004,7 +1345,7 @@ public class WallTextModule
         }
 
         CloseMenu(player);
-        player.SendChat($"{Prefix()} {T("chat.duplicated", cloneName, source.Name)}");
+        SendColoredChat(player, $"{Prefix()} {T("chat.duplicated", cloneName, source.Name)}");
 
         BeginPointCapture(player, (p, point, normal) =>
         {
@@ -1019,12 +1360,14 @@ public class WallTextModule
                 Angles = [angle.Pitch, angle.Yaw, angle.Roll],
                 Enabled = true,
                 ColorHex = source.ColorHex,
+                FontName = source.FontName,
                 FontSize = source.FontSize,
                 Scale = source.Scale,
                 Background = source.Background,
                 Fullbright = source.Fullbright,
                 FacePlayer = source.FacePlayer,
                 JustifyHorizontal = source.JustifyHorizontal,
+                JustifyVertical = source.JustifyVertical,
                 DepthOffset = source.DepthOffset,
                 Rainbow = source.Rainbow,
                 RainbowSpeed = source.RainbowSpeed,
@@ -1043,7 +1386,7 @@ public class WallTextModule
             Save();
             SpawnEntity(clone);
 
-            p.SendChat($"{Prefix()} {T("chat.created", cloneName, clone.Text)}");
+            SendColoredChat(p, $"{Prefix()} {T("chat.created", cloneName, clone.Text)}");
             _core.Scheduler.NextTick(() => OpenDetailMenu(p, cloneName));
         });
     }
@@ -1053,28 +1396,30 @@ public class WallTextModule
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return;
         }
 
         var pawn = player.PlayerPawn;
         if (pawn == null || !pawn.IsValid || pawn.Health <= 0) return;
 
-        float yawRad = data.Angles[1] * (MathF.PI / 180f);
+        // Text face points along yaw - 90 (see CalculateWallAngles)
+        float yawRad = FaceYaw(data) * (MathF.PI / 180f);
         float forwardX = MathF.Cos(yawRad);
         float forwardY = MathF.Sin(yawRad);
 
+        // Place player in front of the text without sinking below floor level
         var targetPos = new Vector(
             data.Position[0] + forwardX * 75f,
             data.Position[1] + forwardY * 75f,
-            data.Position[2] - 40f
+            data.Position[2]
         );
 
-        float lookYaw = (data.Angles[1] + 180f) % 360f;
+        float lookYaw = NormalizeAngle(FaceYaw(data) + 180f);
         var targetAng = new QAngle(0f, lookYaw, 0f);
 
         pawn.Teleport(targetPos, targetAng, new Vector(0f, 0f, 0f));
-        player.SendChat($"{Prefix()} {T("chat.teleported", data.Name)}");
+        SendColoredChat(player, $"{Prefix()} {T("chat.teleported", data.Name)}");
     }
 
     private void BeginRename(IPlayer player, string name)
@@ -1082,12 +1427,12 @@ public class WallTextModule
         var key = FindKey(name);
         if (key == null)
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return;
         }
 
-        _pendingRename[player.SteamID] = key;
-        player.SendChat($"{Prefix()} {T("chat.enter_new_name")}");
+        SetPendingChat(player, ChatPromptKind.Rename, key);
+        SendColoredChat(player, $"{Prefix()} {T("chat.enter_new_name")}");
     }
 
     private HookResult OnClientChat(int playerId, string text, bool teamonly)
@@ -1098,73 +1443,57 @@ public class WallTextModule
             return HookResult.Continue;
         }
 
+        if (!_pendingChatBySlot.TryGetValue(player.Slot, out var prompt) || prompt.SteamId != player.SteamID)
+        {
+            return HookResult.Continue;
+        }
+
         text = text.Trim();
 
-        if (_pendingNewText.TryGetValue(player.SteamID, out var pending))
+        // Allow !text or /text commands to cancel the prompt and execute the command
+        if (text.StartsWith("!text", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("/text", StringComparison.OrdinalIgnoreCase))
         {
-            _pendingNewText.Remove(player.SteamID);
-            return HandleNewTextInput(player, pending, text);
+            _pendingChatBySlot.Remove(player.Slot);
+            return HookResult.Continue;
         }
 
-        if (_pendingTextChange.TryGetValue(player.SteamID, out var changeName))
-        {
-            _pendingTextChange.Remove(player.SteamID);
-            return HandleTextChangeInput(player, changeName, text);
-        }
+        _pendingChatBySlot.Remove(player.Slot);
 
-        if (_pendingRename.TryGetValue(player.SteamID, out var oldName))
+        return prompt.Kind switch
         {
-            _pendingRename.Remove(player.SteamID);
-            return HandleRenameInput(player, oldName, text);
-        }
-
-        if (_pendingColorChange.TryGetValue(player.SteamID, out var colorTargetName))
-        {
-            _pendingColorChange.Remove(player.SteamID);
-            return HandleColorChangeInput(player, colorTargetName, text);
-        }
-
-        if (_pendingAddRotatingMsg.TryGetValue(player.SteamID, out var rotTargetName))
-        {
-            _pendingAddRotatingMsg.Remove(player.SteamID);
-            return HandleAddRotatingMsgInput(player, rotTargetName, text);
-        }
-
-        if (_pendingInteractMsg.TryGetValue(player.SteamID, out var interactMsgName))
-        {
-            _pendingInteractMsg.Remove(player.SteamID);
-            return HandleInteractMsgInput(player, interactMsgName, text);
-        }
-
-        if (_pendingInteractCmd.TryGetValue(player.SteamID, out var interactCmdName))
-        {
-            _pendingInteractCmd.Remove(player.SteamID);
-            return HandleInteractCmdInput(player, interactCmdName, text);
-        }
-
-        return HookResult.Continue;
+            ChatPromptKind.NewText => HandleNewTextInput(player, prompt, text),
+            ChatPromptKind.ChangeText => HandleTextChangeInput(player, prompt.TargetName, text),
+            ChatPromptKind.Rename => HandleRenameInput(player, prompt.TargetName, text),
+            ChatPromptKind.ColorHex => HandleColorChangeInput(player, prompt.TargetName, text),
+            ChatPromptKind.AddRotatingMessage => HandleAddRotatingMsgInput(player, prompt.TargetName, text),
+            ChatPromptKind.InteractMessage => HandleInteractMsgInput(player, prompt.TargetName, text),
+            ChatPromptKind.InteractCommand => HandleInteractCmdInput(player, prompt.TargetName, text),
+            _ => HookResult.Continue
+        };
     }
 
     private static bool IsCancelWord(string text) =>
         text.Equals("cancel", StringComparison.OrdinalIgnoreCase) || text.Equals("iptal", StringComparison.OrdinalIgnoreCase);
 
-    private HookResult HandleNewTextInput(IPlayer player, PendingCreation pending, string text)
+    private HookResult HandleNewTextInput(IPlayer player, PendingChatPrompt pending, string text)
     {
         if (IsCancelWord(text))
         {
-            player.SendChat($"{Prefix()} {T("chat.rename_cancelled")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.rename_cancelled")}");
             return HookResult.Stop;
         }
 
         if (string.IsNullOrWhiteSpace(text))
         {
-            player.SendChat($"{Prefix()} {T("chat.enter_text")}");
+            _pendingChatBySlot[player.Slot] = pending;
+            SendColoredChat(player, $"{Prefix()} {T("chat.enter_text")}");
             return HookResult.Stop;
         }
 
-        if (FindKey(pending.Name) != null)
+        if (FindKey(pending.TargetName) != null)
         {
-            player.SendChat($"{Prefix()} {T("chat.already_exists", pending.Name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.already_exists", pending.TargetName)}");
             return HookResult.Stop;
         }
 
@@ -1172,26 +1501,28 @@ public class WallTextModule
 
         var data = new WallTextData
         {
-            Name = pending.Name,
+            Name = pending.TargetName,
             Text = text,
             Position = [pending.Position.X, pending.Position.Y, pending.Position.Z],
             Angles = [pending.Angles.Pitch, pending.Angles.Yaw, pending.Angles.Roll],
-            ColorHex = _config.DefaultColorHex,
+            ColorHex = NormalizeHex(_config.DefaultColorHex),
+            FontName = _config.DefaultFontName,
             FontSize = _config.DefaultFontSize,
             Scale = _config.DefaultScale,
             Background = _config.DefaultBackground,
             Fullbright = _config.DefaultFullbright,
             FacePlayer = _config.DefaultFacePlayer,
             JustifyHorizontal = _config.DefaultJustifyHorizontal,
+            JustifyVertical = _config.DefaultJustifyVertical,
             DepthOffset = _config.DefaultDepthOffset,
         };
 
-        _store[pending.Name] = data;
+        _store[pending.TargetName] = data;
         Save();
         SpawnEntity(data);
 
-        player.SendChat($"{Prefix()} {T("chat.created", pending.Name, text)}");
-        _core.Scheduler.NextTick(() => OpenDetailMenu(player, pending.Name));
+        SendColoredChat(player, $"{Prefix()} {T("chat.created", pending.TargetName, text)}");
+        _core.Scheduler.NextTick(() => OpenDetailMenu(player, pending.TargetName));
         return HookResult.Stop;
     }
 
@@ -1199,13 +1530,22 @@ public class WallTextModule
     {
         if (IsCancelWord(text))
         {
-            player.SendChat($"{Prefix()} {T("chat.rename_cancelled")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.rename_cancelled")}");
+            _core.Scheduler.NextTick(() => OpenDetailMenu(player, name));
             return HookResult.Stop;
         }
 
-        if (string.IsNullOrWhiteSpace(text) || !_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
+            return HookResult.Stop;
+        }
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            SetPendingChat(player, ChatPromptKind.ChangeText, data.Name);
+            SendColoredChat(player, $"{Prefix()} {T("chat.enter_text")}");
             return HookResult.Stop;
         }
 
@@ -1215,8 +1555,8 @@ public class WallTextModule
 
         UpdateLiveEntity(data);
 
-        player.SendChat($"{Prefix()} {T("chat.text_changed", text)}");
-        _core.Scheduler.NextTick(() => OpenDetailMenu(player, name));
+        SendColoredChat(player, $"{Prefix()} {T("chat.text_changed", text)}");
+        _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
         return HookResult.Stop;
     }
 
@@ -1224,34 +1564,53 @@ public class WallTextModule
     {
         if (IsCancelWord(newName))
         {
-            player.SendChat($"{Prefix()} {T("chat.rename_cancelled")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.rename_cancelled")}");
+            _core.Scheduler.NextTick(() => OpenDetailMenu(player, oldName));
             return HookResult.Stop;
         }
 
-        if (string.IsNullOrWhiteSpace(newName) || !_store.TryGetValue(oldName, out var data))
+        var oldKey = FindKey(oldName);
+        if (oldKey == null || !_store.TryGetValue(oldKey, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", oldName)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", oldName)}");
             return HookResult.Stop;
         }
 
-        if (FindKey(newName) != null && !newName.Equals(oldName, StringComparison.OrdinalIgnoreCase))
+        newName = newName.Trim();
+        if (string.IsNullOrWhiteSpace(newName))
         {
-            player.SendChat($"{Prefix()} {T("chat.already_exists", newName)}");
+            SetPendingChat(player, ChatPromptKind.Rename, oldKey);
+            SendColoredChat(player, $"{Prefix()} {T("chat.enter_new_name")}");
             return HookResult.Stop;
         }
 
-        _store.Remove(oldName);
+        if (FindKey(newName) != null && !newName.Equals(oldKey, StringComparison.OrdinalIgnoreCase))
+        {
+            SetPendingChat(player, ChatPromptKind.Rename, oldKey);
+            SendColoredChat(player, $"{Prefix()} {T("chat.already_exists", newName)}");
+            return HookResult.Stop;
+        }
+
+        _store.Remove(oldKey);
         data.Name = newName;
         _store[newName] = data;
         Save();
 
-        if (_liveEntities.Remove(oldName, out var entity))
+        if (_liveEntities.Remove(oldKey, out var entity))
         {
             _liveEntities[newName] = entity;
         }
+        if (_dynamicTextRenderCache.Remove(oldKey, out var cachedText))
+        {
+            _dynamicTextRenderCache[newName] = cachedText;
+        }
+        if (_rotatingState.Remove(oldKey, out var rotState))
+        {
+            _rotatingState[newName] = rotState;
+        }
 
-        player.SendChat($"{Prefix()} {T("chat.renamed", newName)}");
-        _core.Scheduler.NextTick(() => OpenListMenu(player));
+        SendColoredChat(player, $"{Prefix()} {T("chat.renamed", newName)}");
+        _core.Scheduler.NextTick(() => OpenDetailMenu(player, newName));
         return HookResult.Stop;
     }
 
@@ -1259,30 +1618,32 @@ public class WallTextModule
     {
         if (IsCancelWord(hexInput))
         {
-            player.SendChat($"{Prefix()} {T("chat.rename_cancelled")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.rename_cancelled")}");
+            _core.Scheduler.NextTick(() => OpenColorMenu(player, name));
             return HookResult.Stop;
         }
 
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return HookResult.Stop;
         }
 
         if (!IsValidHex(hexInput))
         {
-            player.SendChat($"{Prefix()} {T("chat.invalid_color_hex")}");
-            _pendingColorChange[player.SteamID] = name;
+            SendColoredChat(player, $"{Prefix()} {T("chat.invalid_color_hex")}");
+            SetPendingChat(player, ChatPromptKind.ColorHex, data.Name);
             return HookResult.Stop;
         }
 
-        data.ColorHex = NormalizeHex(hexInput).ToUpperInvariant();
+        data.ColorHex = NormalizeHex(hexInput);
         data.Rainbow = false; // Turn off rainbow when picking static color
         Save();
         UpdateLiveEntity(data);
 
-        player.SendChat($"{Prefix()} {T("chat.color_changed", data.ColorHex)}");
-        _core.Scheduler.NextTick(() => OpenDetailMenu(player, name));
+        SendColoredChat(player, $"{Prefix()} {T("chat.color_changed", data.ColorHex)}");
+        _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
         return HookResult.Stop;
     }
 
@@ -1290,13 +1651,15 @@ public class WallTextModule
     {
         if (IsCancelWord(text))
         {
-            player.SendChat($"{Prefix()} {T("chat.rename_cancelled")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.rename_cancelled")}");
+            _core.Scheduler.NextTick(() => OpenRotatingMenu(player, name));
             return HookResult.Stop;
         }
 
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return HookResult.Stop;
         }
 
@@ -1306,8 +1669,8 @@ public class WallTextModule
         Save();
         UpdateLiveEntity(data);
 
-        player.SendChat($"{Prefix()} {T("chat.rotating_message_added", text)}");
-        _core.Scheduler.NextTick(() => OpenRotatingMenu(player, name));
+        SendColoredChat(player, $"{Prefix()} {T("chat.rotating_message_added", text)}");
+        _core.Scheduler.NextTick(() => OpenRotatingMenu(player, data.Name));
         return HookResult.Stop;
     }
 
@@ -1315,13 +1678,15 @@ public class WallTextModule
     {
         if (IsCancelWord(text))
         {
-            player.SendChat($"{Prefix()} {T("chat.rename_cancelled")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.rename_cancelled")}");
+            _core.Scheduler.NextTick(() => OpenInteractMenu(player, name));
             return HookResult.Stop;
         }
 
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return HookResult.Stop;
         }
 
@@ -1329,8 +1694,8 @@ public class WallTextModule
         data.IsInteractable = true;
         Save();
 
-        player.SendChat($"{Prefix()} {T("chat.interact_msg_set", data.MessageToPlayer)}");
-        _core.Scheduler.NextTick(() => OpenInteractMenu(player, name));
+        SendColoredChat(player, $"{Prefix()} {T("chat.interact_msg_set", data.MessageToPlayer)}");
+        _core.Scheduler.NextTick(() => OpenInteractMenu(player, data.Name));
         return HookResult.Stop;
     }
 
@@ -1338,13 +1703,15 @@ public class WallTextModule
     {
         if (IsCancelWord(text))
         {
-            player.SendChat($"{Prefix()} {T("chat.rename_cancelled")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.rename_cancelled")}");
+            _core.Scheduler.NextTick(() => OpenInteractMenu(player, name));
             return HookResult.Stop;
         }
 
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return HookResult.Stop;
         }
 
@@ -1352,8 +1719,8 @@ public class WallTextModule
         data.IsInteractable = true;
         Save();
 
-        player.SendChat($"{Prefix()} {T("chat.interact_cmd_set", data.CommandToRun)}");
-        _core.Scheduler.NextTick(() => OpenInteractMenu(player, name));
+        SendColoredChat(player, $"{Prefix()} {T("chat.interact_cmd_set", data.CommandToRun)}");
+        _core.Scheduler.NextTick(() => OpenInteractMenu(player, data.Name));
         return HookResult.Stop;
     }
 
@@ -1362,28 +1729,28 @@ public class WallTextModule
         var key = FindKey(name);
         if (key == null)
         {
-            player.SendChat($"{Prefix()} {T("chat.not_found", name)}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
             return;
         }
 
         DespawnEntity(key);
         _store.Remove(key);
         Save();
-        player.SendChat($"{Prefix()} {T("chat.deleted", key)}");
+        SendColoredChat(player, $"{Prefix()} {T("chat.deleted", key)}");
     }
 
     private void ListWallTexts(IPlayer player)
     {
         if (_store.Count == 0)
         {
-            player.SendChat($"{Prefix()} {T("chat.list_empty")}");
+            SendColoredChat(player, $"{Prefix()} {T("chat.list_empty")}");
             return;
         }
 
-        player.SendChat($"{Prefix()} {T("chat.list_header", _mapContext.CurrentMap)}");
+        SendColoredChat(player, $"{Prefix()} {T("chat.list_header", _mapContext.CurrentMap)}");
         foreach (var data in _store.Values)
         {
-            player.SendChat($" - {data.Name}: \"{data.Text}\" [{(data.Enabled ? "ON" : "OFF")}] (Color: {(data.Rainbow ? "RAINBOW" : data.ColorHex)})");
+            SendColoredChat(player, $" - [lime]{data.Name}[default]: \"{data.Text}\" [{(data.Enabled ? "ON" : "OFF")}] (Color: {(data.Rainbow ? "RAINBOW" : data.ColorHex)})");
         }
     }
 
@@ -1394,6 +1761,11 @@ public class WallTextModule
             return true;
         }
         return _core.Permission.PlayerHasPermission(player.SteamID, _config.Permission);
+    }
+
+    private static void SendColoredChat(IPlayer player, string message)
+    {
+        player.SendChat(WallTextPlaceholders.NormalizeChatColors(message));
     }
 
     private string T(string key, params object[] args)
@@ -1419,6 +1791,50 @@ public class WallTextModule
     // Menus
     // ------------------------------------------------------------------
 
+    private void ShowMenu(IPlayer player, IMenuAPI menu, string contextName, [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
+    {
+        // Menus are rebuilt after every click (to refresh labels), which resets the cursor to the top.
+        // Remember the highlighted index per (menu, text) and restore it so the admin stays on the same option.
+        string key = $"{caller}:{contextName}";
+        int slot = player.Slot;
+        if (!_menuCursorBySlot.TryGetValue(slot, out var cursors))
+        {
+            cursors = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            _menuCursorBySlot[slot] = cursors;
+        }
+
+        try
+        {
+            var current = _core.MenusAPI.GetCurrentMenu(player);
+            if (current != null
+                && string.Equals(current.Tag as string, MenuTag, StringComparison.Ordinal)
+                && _activeMenuKeyBySlot.TryGetValue(slot, out var currentKey))
+            {
+                cursors[currentKey] = current.GetCurrentOptionIndex(player);
+            }
+        }
+        catch
+        {
+            // Menu may already be closing
+        }
+
+        menu.Tag = MenuTag;
+        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        _activeMenuKeyBySlot[slot] = key;
+
+        if (cursors.TryGetValue(key, out var index) && index > 0)
+        {
+            try
+            {
+                menu.MoveToOptionIndex(player, index);
+            }
+            catch
+            {
+                // Option count may have shrunk - keep default cursor
+            }
+        }
+    }
+
     private void CloseMenu(IPlayer player)
     {
         var current = _core.MenusAPI.GetCurrentMenu(player);
@@ -1426,6 +1842,40 @@ public class WallTextModule
         {
             _core.MenusAPI.CloseMenuForPlayer(player, current);
         }
+    }
+
+    private void CloseAllMenus()
+    {
+        try
+        {
+            foreach (var player in _core.PlayerManager.GetAllPlayers())
+            {
+                if (player != null && player.IsValid && !player.IsFakeClient)
+                {
+                    var current = _core.MenusAPI.GetCurrentMenu(player);
+                    if (current != null && string.Equals(current.Tag as string, MenuTag, StringComparison.Ordinal))
+                    {
+                        _core.MenusAPI.CloseMenuForPlayer(player, current);
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore during shutdown
+        }
+    }
+
+    private string GenerateUniqueDefaultName()
+    {
+        int idx = _store.Count + 1;
+        string candidate = $"Text_{idx}";
+        while (FindKey(candidate) != null)
+        {
+            idx++;
+            candidate = $"Text_{idx}";
+        }
+        return candidate;
     }
 
     private void OpenMainMenu(IPlayer player)
@@ -1436,7 +1886,7 @@ public class WallTextModule
         var createBtn = new ButtonMenuOption(T("menu.option.create"), 1000);
         createBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() => BeginCreate(player, $"Text_{_store.Count + 1}"));
+            _core.Scheduler.NextTick(() => BeginCreate(player, GenerateUniqueDefaultName()));
             return ValueTask.CompletedTask;
         };
         builder.AddOption(createBtn);
@@ -1450,8 +1900,7 @@ public class WallTextModule
         builder.AddOption(manageBtn);
 
         var menu = builder.Build();
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        ShowMenu(player, menu, "");
     }
 
     private void OpenListMenu(IPlayer player)
@@ -1469,7 +1918,9 @@ public class WallTextModule
             {
                 var capturedName = name;
                 var data = _store[name];
-                var label = $"{data.Name}: \"{data.Text}\" [{(data.Enabled ? "ON" : "OFF")}]";
+                string preview = data.Text.Replace("\n", " ");
+                if (preview.Length > 20) preview = preview[..17] + "...";
+                var label = $"{data.Name}: \"{preview}\" [{(data.Enabled ? "ON" : "OFF")}]";
                 var btn = new ButtonMenuOption(label, 1000);
                 btn.Click += (sender, args) =>
                 {
@@ -1489,13 +1940,13 @@ public class WallTextModule
         builder.AddOption(backBtn);
 
         var menu = builder.Build();
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        ShowMenu(player, menu, "");
     }
 
     private void OpenDetailMenu(IPlayer player, string name)
     {
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
             return;
@@ -1524,16 +1975,7 @@ public class WallTextModule
         };
         builder.AddOption(enabledToggle);
 
-        // 2. Teleport To Text
-        var tpBtn = new ButtonMenuOption(T("menu.option.teleport"), 1000);
-        tpBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => TeleportToText(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(tpBtn);
-
-        // 3. Move To Crosshair (Instant)
+        // 2. Move To Crosshair (Instant)
         var crosshairBtn = new ButtonMenuOption(T("menu.option.move_to_crosshair"), 1000);
         crosshairBtn.Click += (sender, args) =>
         {
@@ -1542,192 +1984,47 @@ public class WallTextModule
         };
         builder.AddOption(crosshairBtn);
 
-        // 4. Dikey & Yukarı Rotate / Açı Düzeltme Butonları
-        var pitchUpBtn = new ButtonMenuOption(T("menu.option.pitch_up"), 1000);
-        pitchUpBtn.Click += (sender, args) =>
+        // 3. Orientation & Quick Align Sub-Menu
+        var orientMenuBtn = new ButtonMenuOption(T("menu.option.orientation_menu"), 1000);
+        orientMenuBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = (data.Angles[0] + 90f) % 360f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
+            _core.Scheduler.NextTick(() => OpenOrientationMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
-        builder.AddOption(pitchUpBtn);
+        builder.AddOption(orientMenuBtn);
 
-        var pitchDownBtn = new ButtonMenuOption(T("menu.option.pitch_down"), 1000);
-        pitchDownBtn.Click += (sender, args) =>
+        // 4. Fine-Tune Position & Angles Sub-Menu
+        var fineTuneBtn = new ButtonMenuOption(T("menu.option.fine_tune"), 1000);
+        fineTuneBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = (data.Angles[0] - 90f) % 360f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
+            _core.Scheduler.NextTick(() => OpenFineTuneMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
-        builder.AddOption(pitchDownBtn);
+        builder.AddOption(fineTuneBtn);
 
-        var presetVertBtn = new ButtonMenuOption(T("menu.option.preset_vertical"), 1000);
-        presetVertBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = 90f;
-                data.Angles[2] = 0f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(presetVertBtn);
-
-        var presetVertNegBtn = new ButtonMenuOption(T("menu.option.preset_vertical_neg"), 1000);
-        presetVertNegBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = -90f;
-                data.Angles[2] = 0f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(presetVertNegBtn);
-
-        var presetFlatBtn = new ButtonMenuOption(T("menu.option.preset_flat"), 1000);
-        presetFlatBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = 0f;
-                data.Angles[2] = 0f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(presetFlatBtn);
-
-        var rot90Btn = new ButtonMenuOption(T("menu.option.rotate_90"), 1000);
-        rot90Btn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[1] = (data.Angles[1] + 90f) % 360f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(rot90Btn);
-
-        var rollBtn = new ButtonMenuOption(T("menu.option.roll_rotate"), 1000);
-        rollBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[2] = (data.Angles[2] + 90f) % 360f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(rollBtn);
-
-        var flip180Btn = new ButtonMenuOption(T("menu.option.flip_180"), 1000);
-        flip180Btn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[1] = (data.Angles[1] + 180f) % 360f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(flip180Btn);
-
-        var faceAdminBtn = new ButtonMenuOption(T("menu.option.face_admin"), 1000);
-        faceAdminBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                if (player.PlayerPawn != null && player.PlayerPawn.AbsOrigin.HasValue)
-                {
-                    var pPos = player.PlayerPawn.AbsOrigin.Value;
-                    float dx = pPos.X - data.Position[0];
-                    float dy = pPos.Y - data.Position[1];
-                    data.Angles[1] = MathF.Atan2(dy, dx) * (180f / MathF.PI);
-                    Save();
-                    UpdateLiveEntity(data);
-                }
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(faceAdminBtn);
-
-        // 5. Re-aim & Reposition via shoot
-        var reaimBtn = new ButtonMenuOption(T("menu.option.reaim"), 1000);
-        reaimBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => BeginReaim(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(reaimBtn);
-
-        // 6. Duplicate / Clone
-        var dupBtn = new ButtonMenuOption(T("menu.option.duplicate"), 1000);
-        dupBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => BeginDuplicate(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(dupBtn);
-
-        // 7. Change Text
+        // 5. Change Text
         var changeTextBtn = new ButtonMenuOption(T("menu.option.change_text"), 1000);
         changeTextBtn.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                _pendingTextChange[player.SteamID] = data.Name;
-                player.SendChat($"{Prefix()} {T("chat.enter_text")}");
+                SetPendingChat(player, ChatPromptKind.ChangeText, data.Name);
+                SendColoredChat(player, $"{Prefix()} {T("chat.enter_text")}");
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(changeTextBtn);
 
-        // 8. Rotating Announcer Board Sub-Menu
-        var rotMenuBtn = new ButtonMenuOption(T("menu.option.rotating_menu", data.RotatingMessages.Count), 1000);
-        rotMenuBtn.Click += (sender, args) =>
+        // 6. Color Sub-Menu
+        var colorBtn = new ButtonMenuOption(T("menu.option.color_menu", data.ColorHex), 1000);
+        colorBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() => OpenRotatingMenu(player, data.Name));
+            _core.Scheduler.NextTick(() => OpenColorMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
-        builder.AddOption(rotMenuBtn);
+        builder.AddOption(colorBtn);
 
-        // 9. Interactive Trigger Sub-Menu
-        var interactMenuBtn = new ButtonMenuOption(T("menu.option.interact_menu"), 1000);
-        interactMenuBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenInteractMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(interactMenuBtn);
-
-        // 10. Rainbow (RGB) Toggle & Speed
+        // 7. Rainbow (RGB) Toggle & Speed
         var rainbowToggle = new ToggleMenuOption(T("menu.option.rainbow", data.Rainbow ? "ON" : "OFF"), data.Rainbow);
         rainbowToggle.ValueChanged += (sender, e) =>
         {
@@ -1763,72 +2060,42 @@ public class WallTextModule
             builder.AddOption(speedBtn);
         }
 
-        // 11. Color Sub-Menu
-        var colorBtn = new ButtonMenuOption(T("menu.option.color_menu", data.ColorHex), 1000);
-        colorBtn.Click += (sender, args) =>
+        // 8. Rotating Announcer Board Sub-Menu
+        var rotMenuBtn = new ButtonMenuOption(T("menu.option.rotating_menu", data.RotatingMessages.Count), 1000);
+        rotMenuBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() => OpenColorMenu(player, data.Name));
+            _core.Scheduler.NextTick(() => OpenRotatingMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
-        builder.AddOption(colorBtn);
+        builder.AddOption(rotMenuBtn);
 
-        // 12. Face Player (Billboard) Toggle
-        var facePlayerToggle = new ToggleMenuOption(T("menu.option.face_player"), data.FacePlayer);
-        facePlayerToggle.ValueChanged += (sender, e) =>
+        // 9. Interactive Trigger Sub-Menu
+        var interactMenuBtn = new ButtonMenuOption(T("menu.option.interact_menu"), 1000);
+        interactMenuBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() => OpenInteractMenu(player, data.Name));
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(interactMenuBtn);
+
+        // 10. Sliders & Styling: Font, Font Size, Scale, Background, Fullbright, FacePlayer, Alignment
+        string fontLabel = string.IsNullOrWhiteSpace(data.FontName) ? "Default" : data.FontName;
+        var fontBtn = new ButtonMenuOption(T("menu.option.font", fontLabel), 1000);
+        fontBtn.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.FacePlayer = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-            });
-        };
-        builder.AddOption(facePlayerToggle);
-
-        // 13. Fullbright Toggle
-        var fullbrightToggle = new ToggleMenuOption(T("menu.option.fullbright"), data.Fullbright);
-        fullbrightToggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Fullbright = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-            });
-        };
-        builder.AddOption(fullbrightToggle);
-
-        // 14. Horizontal Justification Button
-        string justifyLabel = data.JustifyHorizontal switch
-        {
-            0 => T("menu.option.justify_left"),
-            2 => T("menu.option.justify_right"),
-            _ => T("menu.option.justify_center")
-        };
-        var justifyBtn = new ButtonMenuOption(T("menu.option.justify", justifyLabel), 1000);
-        justifyBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.JustifyHorizontal = (data.JustifyHorizontal + 1) % 3;
+                int curIdx = Array.IndexOf(AvailableFonts, data.FontName ?? "");
+                int nextIdx = (curIdx + 1) % AvailableFonts.Length;
+                data.FontName = AvailableFonts[nextIdx];
                 Save();
                 UpdateLiveEntity(data);
                 OpenDetailMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
-        builder.AddOption(justifyBtn);
+        builder.AddOption(fontBtn);
 
-        // 15. Fine-Tune Position & Angles Sub-Menu
-        var fineTuneBtn = new ButtonMenuOption(T("menu.option.fine_tune"), 1000);
-        fineTuneBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenFineTuneMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(fineTuneBtn);
-
-        // 16. Sliders: Font Size, Scale, Background
         var fontSizeSlider = new SliderMenuOption(T("menu.option.font_size"), 8f, 72f, data.FontSize, 1f, 10, 120, 1000);
         fontSizeSlider.ValueChanged += (sender, e) =>
         {
@@ -1853,6 +2120,70 @@ public class WallTextModule
         };
         builder.AddOption(scaleSlider);
 
+        string justifyLabel = data.JustifyHorizontal switch
+        {
+            0 => T("menu.option.justify_left"),
+            2 => T("menu.option.justify_right"),
+            _ => T("menu.option.justify_center")
+        };
+        var justifyBtn = new ButtonMenuOption(T("menu.option.justify", justifyLabel), 1000);
+        justifyBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.JustifyHorizontal = (data.JustifyHorizontal + 1) % 3;
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(justifyBtn);
+
+        string justifyVertLabel = data.JustifyVertical switch
+        {
+            0 => T("menu.option.justify_bottom"),
+            2 => T("menu.option.justify_top"),
+            _ => T("menu.option.justify_center")
+        };
+        var justifyVertBtn = new ButtonMenuOption(T("menu.option.justify_vert", justifyVertLabel), 1000);
+        justifyVertBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.JustifyVertical = (data.JustifyVertical + 1) % 3;
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(justifyVertBtn);
+
+        var facePlayerToggle = new ToggleMenuOption(T("menu.option.face_player"), data.FacePlayer);
+        facePlayerToggle.ValueChanged += (sender, e) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.FacePlayer = e.NewValue;
+                Save();
+                UpdateLiveEntity(data);
+            });
+        };
+        builder.AddOption(facePlayerToggle);
+
+        var fullbrightToggle = new ToggleMenuOption(T("menu.option.fullbright"), data.Fullbright);
+        fullbrightToggle.ValueChanged += (sender, e) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Fullbright = e.NewValue;
+                Save();
+                UpdateLiveEntity(data);
+            });
+        };
+        builder.AddOption(fullbrightToggle);
+
         var backgroundToggle = new ToggleMenuOption(T("menu.option.background"), data.Background);
         backgroundToggle.ValueChanged += (sender, e) =>
         {
@@ -1865,7 +2196,31 @@ public class WallTextModule
         };
         builder.AddOption(backgroundToggle);
 
-        // 17. Rename Id
+        // 11. Teleport, Re-aim, Duplicate, Rename, Delete
+        var tpBtn = new ButtonMenuOption(T("menu.option.teleport"), 1000);
+        tpBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() => TeleportToText(player, data.Name));
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(tpBtn);
+
+        var reaimBtn = new ButtonMenuOption(T("menu.option.reaim"), 1000);
+        reaimBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() => BeginReaim(player, data.Name));
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(reaimBtn);
+
+        var dupBtn = new ButtonMenuOption(T("menu.option.duplicate"), 1000);
+        dupBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() => BeginDuplicate(player, data.Name));
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(dupBtn);
+
         var renameBtn = new ButtonMenuOption(T("menu.option.rename"), 1000);
         renameBtn.Click += (sender, args) =>
         {
@@ -1874,7 +2229,6 @@ public class WallTextModule
         };
         builder.AddOption(renameBtn);
 
-        // 18. Delete Button
         var deleteBtn = new ButtonMenuOption(T("menu.option.delete"), 1000);
         deleteBtn.Click += (sender, args) =>
         {
@@ -1883,14 +2237,13 @@ public class WallTextModule
                 DespawnEntity(data.Name);
                 _store.Remove(data.Name);
                 Save();
-                player.SendChat($"{Prefix()} {T("chat.deleted", data.Name)}");
+                SendColoredChat(player, $"{Prefix()} {T("chat.deleted", data.Name)}");
                 OpenListMenu(player);
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(deleteBtn);
 
-        // 19. Back Button
         var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
         backBtn.Click += (sender, args) =>
         {
@@ -1900,8 +2253,228 @@ public class WallTextModule
         builder.AddOption(backBtn);
 
         var menu = builder.Build();
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        ShowMenu(player, menu, name);
+    }
+
+    // ------------------------------------------------------------------
+    // Sub-Menu: Orientation & Quick Alignment Tools
+    // ------------------------------------------------------------------
+
+    private void OpenOrientationMenu(IPlayer player, string name)
+    {
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
+        {
+            OpenListMenu(player);
+            return;
+        }
+
+        var builder = _core.MenusAPI.CreateBuilder();
+        builder.Design.SetMenuTitle(T("menu.title.orientation", $"{data.Name} [P:{data.Angles[0]:0}° Y:{data.Angles[1]:0}° R:{data.Angles[2]:0}°]"));
+
+        // Move to crosshair
+        var crosshairBtn = new ButtonMenuOption(T("menu.option.move_to_crosshair"), 1000);
+        crosshairBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() => MoveToCrosshair(player, data.Name, returnToOrientationMenu: true));
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(crosshairBtn);
+
+        // Face towards admin (Horizontal Yaw only)
+        var faceAdminBtn = new ButtonMenuOption(T("menu.option.face_admin"), 1000);
+        faceAdminBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                if (player.PlayerPawn != null && player.PlayerPawn.AbsOrigin.HasValue)
+                {
+                    var pPos = player.PlayerPawn.AbsOrigin.Value;
+                    float dx = pPos.X - data.Position[0];
+                    float dy = pPos.Y - data.Position[1];
+                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, 0f, keepUpright: true);
+                    data.Angles[0] = fp;
+                    data.Angles[1] = fy;
+                    data.Angles[2] = fr;
+                    Save();
+                    UpdateLiveEntity(data);
+                }
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(faceAdminBtn);
+
+        // Face towards admin's eyes (Full 3D Pitch + Yaw)
+        var faceAdmin3dBtn = new ButtonMenuOption(T("menu.option.face_admin_3d"), 1000);
+        faceAdmin3dBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                if (player.PlayerPawn != null && TryGetEyePosition(player.PlayerPawn, out var eyePos))
+                {
+                    float dx = eyePos.X - data.Position[0];
+                    float dy = eyePos.Y - data.Position[1];
+                    float dz = eyePos.Z - data.Position[2];
+                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, dz, keepUpright: false);
+                    data.Angles[0] = fp;
+                    data.Angles[1] = fy;
+                    data.Angles[2] = fr;
+                    Save();
+                    UpdateLiveEntity(data);
+                }
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(faceAdmin3dBtn);
+
+        // Flip 180 deg
+        var flip180Btn = new ButtonMenuOption(T("menu.option.flip_180"), 1000);
+        flip180Btn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[1] = NormalizeAngle(data.Angles[1] + 180f);
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(flip180Btn);
+
+        // Rotate Yaw +90 deg
+        var rot90Btn = new ButtonMenuOption(T("menu.option.rotate_90"), 1000);
+        rot90Btn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[1] = NormalizeAngle(data.Angles[1] + 90f);
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(rot90Btn);
+
+        // Pitch +90 deg
+        var pitchUpBtn = new ButtonMenuOption(T("menu.option.pitch_up"), 1000);
+        pitchUpBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[0] = NormalizeAngle(data.Angles[0] + 90f);
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(pitchUpBtn);
+
+        // Pitch -90 deg
+        var pitchDownBtn = new ButtonMenuOption(T("menu.option.pitch_down"), 1000);
+        pitchDownBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[0] = NormalizeAngle(data.Angles[0] - 90f);
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(pitchDownBtn);
+
+        // Roll +90 deg
+        var rollBtn = new ButtonMenuOption(T("menu.option.roll_rotate"), 1000);
+        rollBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[2] = NormalizeAngle(data.Angles[2] + 90f);
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(rollBtn);
+
+        // Presets
+        var presetVertBtn = new ButtonMenuOption(T("menu.option.preset_vertical"), 1000);
+        presetVertBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[0] = 90f;
+                data.Angles[2] = 0f;
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(presetVertBtn);
+
+        var presetVertNegBtn = new ButtonMenuOption(T("menu.option.preset_vertical_neg"), 1000);
+        presetVertNegBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[0] = -90f;
+                data.Angles[2] = 0f;
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(presetVertNegBtn);
+
+        var presetWallRoll90Btn = new ButtonMenuOption(T("menu.option.preset_wall_roll90"), 1000);
+        presetWallRoll90Btn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[0] = 0f;
+                data.Angles[2] = 90f;
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(presetWallRoll90Btn);
+
+        var presetFlatBtn = new ButtonMenuOption(T("menu.option.preset_flat"), 1000);
+        presetFlatBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Angles[0] = 0f;
+                data.Angles[2] = 0f;
+                Save();
+                UpdateLiveEntity(data);
+                OpenOrientationMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(presetFlatBtn);
+
+        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
+        backBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(backBtn);
+
+        var menu = builder.Build();
+        ShowMenu(player, menu, name);
     }
 
     // ------------------------------------------------------------------
@@ -1910,7 +2483,8 @@ public class WallTextModule
 
     private void OpenRotatingMenu(IPlayer player, string name)
     {
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
             return;
@@ -1928,12 +2502,12 @@ public class WallTextModule
                 data.IsRotating = e.NewValue;
                 Save();
                 UpdateLiveEntity(data);
-                OpenRotatingMenu(player, name);
+                OpenRotatingMenu(player, data.Name);
             });
         };
         builder.AddOption(toggle);
 
-        // Interval button: 10s -> 20s -> 30s -> 60s -> 5s
+        // Interval button: 5s -> 10s -> 20s -> 30s -> 60s
         var intervalBtn = new ButtonMenuOption(T("menu.option.rotating_interval", (int)data.RotationIntervalSeconds), 1000);
         intervalBtn.Click += (sender, args) =>
         {
@@ -1948,7 +2522,7 @@ public class WallTextModule
                     _ => 5f
                 };
                 Save();
-                OpenRotatingMenu(player, name);
+                OpenRotatingMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
@@ -1960,8 +2534,8 @@ public class WallTextModule
         {
             _core.Scheduler.NextTick(() =>
             {
-                _pendingAddRotatingMsg[player.SteamID] = data.Name;
-                player.SendChat($"{Prefix()} {T("chat.enter_rotating_message")}");
+                SetPendingChat(player, ChatPromptKind.AddRotatingMessage, data.Name);
+                SendColoredChat(player, $"{Prefix()} {T("chat.enter_rotating_message")}");
             });
             return ValueTask.CompletedTask;
         };
@@ -1979,8 +2553,8 @@ public class WallTextModule
                     data.IsRotating = false;
                     Save();
                     UpdateLiveEntity(data);
-                    player.SendChat($"{Prefix()} {T("chat.rotating_messages_cleared", data.Name)}");
-                    OpenRotatingMenu(player, name);
+                    SendColoredChat(player, $"{Prefix()} {T("chat.rotating_messages_cleared", data.Name)}");
+                    OpenRotatingMenu(player, data.Name);
                 });
                 return ValueTask.CompletedTask;
             };
@@ -1990,18 +2564,21 @@ public class WallTextModule
             for (int i = 0; i < data.RotatingMessages.Count; i++)
             {
                 int index = i;
-                string preview = data.RotatingMessages[index];
+                string preview = data.RotatingMessages[index].Replace("\n", " ");
                 if (preview.Length > 28) preview = preview[..25] + "...";
                 var itemBtn = new ButtonMenuOption($"#{index + 1}: {preview} [X]", 1000);
                 itemBtn.Click += (sender, args) =>
                 {
                     _core.Scheduler.NextTick(() =>
                     {
-                        data.RotatingMessages.RemoveAt(index);
+                        if (index >= 0 && index < data.RotatingMessages.Count)
+                        {
+                            data.RotatingMessages.RemoveAt(index);
+                        }
                         if (data.RotatingMessages.Count == 0) data.IsRotating = false;
                         Save();
                         UpdateLiveEntity(data);
-                        OpenRotatingMenu(player, name);
+                        OpenRotatingMenu(player, data.Name);
                     });
                     return ValueTask.CompletedTask;
                 };
@@ -2012,14 +2589,13 @@ public class WallTextModule
         var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
         backBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, name));
+            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
         builder.AddOption(backBtn);
 
         var menu = builder.Build();
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        ShowMenu(player, menu, name);
     }
 
     // ------------------------------------------------------------------
@@ -2028,7 +2604,8 @@ public class WallTextModule
 
     private void OpenInteractMenu(IPlayer player, string name)
     {
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
             return;
@@ -2045,7 +2622,7 @@ public class WallTextModule
             {
                 data.IsInteractable = e.NewValue;
                 Save();
-                OpenInteractMenu(player, name);
+                OpenInteractMenu(player, data.Name);
             });
         };
         builder.AddOption(toggle);
@@ -2069,22 +2646,22 @@ public class WallTextModule
                     _ => "both"
                 };
                 Save();
-                OpenInteractMenu(player, name);
+                OpenInteractMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(typeBtn);
 
         // Set message to player
-        string curMsg = string.IsNullOrWhiteSpace(data.MessageToPlayer) ? "Yok" : data.MessageToPlayer;
+        string curMsg = string.IsNullOrWhiteSpace(data.MessageToPlayer) ? "Yok" : data.MessageToPlayer.Replace("\n", " ");
         if (curMsg.Length > 20) curMsg = curMsg[..17] + "...";
         var setMsgBtn = new ButtonMenuOption($"{T("menu.option.set_interact_msg")} [{curMsg}]", 1000);
         setMsgBtn.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                _pendingInteractMsg[player.SteamID] = data.Name;
-                player.SendChat($"{Prefix()} {T("chat.enter_interact_msg")}");
+                SetPendingChat(player, ChatPromptKind.InteractMessage, data.Name);
+                SendColoredChat(player, $"{Prefix()} {T("chat.enter_interact_msg")}");
             });
             return ValueTask.CompletedTask;
         };
@@ -2098,8 +2675,8 @@ public class WallTextModule
         {
             _core.Scheduler.NextTick(() =>
             {
-                _pendingInteractCmd[player.SteamID] = data.Name;
-                player.SendChat($"{Prefix()} {T("chat.enter_interact_cmd")}");
+                SetPendingChat(player, ChatPromptKind.InteractCommand, data.Name);
+                SendColoredChat(player, $"{Prefix()} {T("chat.enter_interact_cmd")}");
             });
             return ValueTask.CompletedTask;
         };
@@ -2119,23 +2696,43 @@ public class WallTextModule
                     _ => 150f
                 };
                 Save();
-                OpenInteractMenu(player, name);
+                OpenInteractMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(distBtn);
 
+        // Cooldown: 0.5s -> 1s -> 2s -> 5s -> 10s
+        var cooldownBtn = new ButtonMenuOption(T("menu.option.interact_cooldown", data.CooldownSeconds), 1000);
+        cooldownBtn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.CooldownSeconds = data.CooldownSeconds switch
+                {
+                    <= 0.5f => 1.0f,
+                    <= 1.0f => 2.0f,
+                    <= 2.0f => 5.0f,
+                    <= 5.0f => 10.0f,
+                    _ => 0.5f
+                };
+                Save();
+                OpenInteractMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(cooldownBtn);
+
         var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
         backBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, name));
+            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
         builder.AddOption(backBtn);
 
         var menu = builder.Build();
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        ShowMenu(player, menu, name);
     }
 
     // ------------------------------------------------------------------
@@ -2144,7 +2741,8 @@ public class WallTextModule
 
     private void OpenColorMenu(IPlayer player, string name)
     {
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
             return;
@@ -2169,9 +2767,9 @@ public class WallTextModule
             ("menu.color.grey", "#888888"),
         };
 
-        foreach (var (key, hex) in presets)
+        foreach (var (presetKey, hex) in presets)
         {
-            var btn = new ButtonMenuOption(T(key), 1000);
+            var btn = new ButtonMenuOption(T(presetKey), 1000);
             var capturedHex = hex;
             btn.Click += (sender, args) =>
             {
@@ -2181,8 +2779,8 @@ public class WallTextModule
                     data.Rainbow = false; // Disable rainbow when selecting static color
                     Save();
                     UpdateLiveEntity(data);
-                    player.SendChat($"{Prefix()} {T("chat.color_changed", capturedHex)}");
-                    OpenColorMenu(player, name);
+                    SendColoredChat(player, $"{Prefix()} {T("chat.color_changed", capturedHex)}");
+                    OpenColorMenu(player, data.Name);
                 });
                 return ValueTask.CompletedTask;
             };
@@ -2194,8 +2792,8 @@ public class WallTextModule
         {
             _core.Scheduler.NextTick(() =>
             {
-                _pendingColorChange[player.SteamID] = data.Name;
-                player.SendChat($"{Prefix()} {T("chat.enter_color_hex")}");
+                SetPendingChat(player, ChatPromptKind.ColorHex, data.Name);
+                SendColoredChat(player, $"{Prefix()} {T("chat.enter_color_hex")}");
             });
             return ValueTask.CompletedTask;
         };
@@ -2204,14 +2802,13 @@ public class WallTextModule
         var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
         backBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, name));
+            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
         builder.AddOption(backBtn);
 
         var menu = builder.Build();
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        ShowMenu(player, menu, name);
     }
 
     // ------------------------------------------------------------------
@@ -2220,16 +2817,17 @@ public class WallTextModule
 
     private void OpenFineTuneMenu(IPlayer player, string name)
     {
-        if (!_store.TryGetValue(name, out var data))
+        var key = FindKey(name);
+        if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
             return;
         }
 
-        if (!_playerStepSizes.TryGetValue(player.SteamID, out var step))
+        if (!_playerStepSizes.TryGetValue(player.Slot, out var step))
         {
             step = 5f;
-            _playerStepSizes[player.SteamID] = step;
+            _playerStepSizes[player.Slot] = step;
         }
 
         var builder = _core.MenusAPI.CreateBuilder();
@@ -2242,68 +2840,46 @@ public class WallTextModule
             {
                 int curIdx = Array.IndexOf(AvailableSteps, step);
                 int nextIdx = (curIdx + 1) % AvailableSteps.Length;
-                _playerStepSizes[player.SteamID] = AvailableSteps[nextIdx];
-                OpenFineTuneMenu(player, name);
+                _playerStepSizes[player.Slot] = AvailableSteps[nextIdx];
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(stepBtn);
 
-        var xPos = new ButtonMenuOption(T("menu.option.nudge_x_pos", step), 1000);
-        xPos.Click += (sender, args) =>
+        // Wall-relative sliding (Right / Left / Out / In based on current Yaw)
+        var wallRight = new ButtonMenuOption(T("menu.option.nudge_wall_right", step), 1000);
+        wallRight.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Position[0] += step;
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                // Viewer's right when facing the text is (-sin(yaw), cos(yaw))
+                data.Position[0] += -MathF.Sin(yawRad) * step;
+                data.Position[1] += MathF.Cos(yawRad) * step;
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
-        builder.AddOption(xPos);
+        builder.AddOption(wallRight);
 
-        var xNeg = new ButtonMenuOption(T("menu.option.nudge_x_neg", step), 1000);
-        xNeg.Click += (sender, args) =>
+        var wallLeft = new ButtonMenuOption(T("menu.option.nudge_wall_left", step), 1000);
+        wallLeft.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Position[0] -= step;
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                data.Position[0] -= -MathF.Sin(yawRad) * step;
+                data.Position[1] -= MathF.Cos(yawRad) * step;
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
-        builder.AddOption(xNeg);
-
-        var yPos = new ButtonMenuOption(T("menu.option.nudge_y_pos", step), 1000);
-        yPos.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[1] += step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(yPos);
-
-        var yNeg = new ButtonMenuOption(T("menu.option.nudge_y_neg", step), 1000);
-        yNeg.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[1] -= step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(yNeg);
+        builder.AddOption(wallLeft);
 
         var zUp = new ButtonMenuOption(T("menu.option.nudge_z_up", step), 1000);
         zUp.Click += (sender, args) =>
@@ -2313,7 +2889,7 @@ public class WallTextModule
                 data.Position[2] += step;
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
@@ -2327,22 +2903,111 @@ public class WallTextModule
                 data.Position[2] -= step;
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(zDown);
 
-        // Pitch (Yukarı / Aşağı Eğme)
+        var wallOut = new ButtonMenuOption(T("menu.option.nudge_wall_out", step), 1000);
+        wallOut.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                data.Position[0] += MathF.Cos(yawRad) * step;
+                data.Position[1] += MathF.Sin(yawRad) * step;
+                Save();
+                UpdateLiveEntity(data);
+                OpenFineTuneMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(wallOut);
+
+        var wallIn = new ButtonMenuOption(T("menu.option.nudge_wall_in", step), 1000);
+        wallIn.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                data.Position[0] -= MathF.Cos(yawRad) * step;
+                data.Position[1] -= MathF.Sin(yawRad) * step;
+                Save();
+                UpdateLiveEntity(data);
+                OpenFineTuneMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(wallIn);
+
+        // World-axis X / Y nudges
+        var xPos = new ButtonMenuOption(T("menu.option.nudge_x_pos", step), 1000);
+        xPos.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Position[0] += step;
+                Save();
+                UpdateLiveEntity(data);
+                OpenFineTuneMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(xPos);
+
+        var xNeg = new ButtonMenuOption(T("menu.option.nudge_x_neg", step), 1000);
+        xNeg.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Position[0] -= step;
+                Save();
+                UpdateLiveEntity(data);
+                OpenFineTuneMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(xNeg);
+
+        var yPos = new ButtonMenuOption(T("menu.option.nudge_y_pos", step), 1000);
+        yPos.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Position[1] += step;
+                Save();
+                UpdateLiveEntity(data);
+                OpenFineTuneMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(yPos);
+
+        var yNeg = new ButtonMenuOption(T("menu.option.nudge_y_neg", step), 1000);
+        yNeg.Click += (sender, args) =>
+        {
+            _core.Scheduler.NextTick(() =>
+            {
+                data.Position[1] -= step;
+                Save();
+                UpdateLiveEntity(data);
+                OpenFineTuneMenu(player, data.Name);
+            });
+            return ValueTask.CompletedTask;
+        };
+        builder.AddOption(yNeg);
+
+        // Pitch (Up / Down tilt)
         var pitchUp = new ButtonMenuOption(T("menu.option.nudge_pitch_up", step), 1000);
         pitchUp.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Angles[0] = (data.Angles[0] + step) % 360f;
+                data.Angles[0] = NormalizeAngle(data.Angles[0] + step);
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
@@ -2353,25 +3018,25 @@ public class WallTextModule
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Angles[0] = (data.Angles[0] - step) % 360f;
+                data.Angles[0] = NormalizeAngle(data.Angles[0] - step);
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(pitchDown);
 
-        // Yaw (Yatay Döndürme)
+        // Yaw (Horizontal rotation)
         var yawLeft = new ButtonMenuOption(T("menu.option.nudge_yaw_left", step), 1000);
         yawLeft.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Angles[1] = (data.Angles[1] - step) % 360f;
+                data.Angles[1] = NormalizeAngle(data.Angles[1] - step);
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
@@ -2382,25 +3047,25 @@ public class WallTextModule
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Angles[1] = (data.Angles[1] + step) % 360f;
+                data.Angles[1] = NormalizeAngle(data.Angles[1] + step);
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
         builder.AddOption(yawRight);
 
-        // Roll (Yan Yatırma)
+        // Roll (Sideways banking)
         var rollRight = new ButtonMenuOption(T("menu.option.nudge_roll_pos", step), 1000);
         rollRight.Click += (sender, args) =>
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Angles[2] = (data.Angles[2] + step) % 360f;
+                data.Angles[2] = NormalizeAngle(data.Angles[2] + step);
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
@@ -2411,10 +3076,10 @@ public class WallTextModule
         {
             _core.Scheduler.NextTick(() =>
             {
-                data.Angles[2] = (data.Angles[2] - step) % 360f;
+                data.Angles[2] = NormalizeAngle(data.Angles[2] - step);
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
@@ -2425,11 +3090,13 @@ public class WallTextModule
         {
             _core.Scheduler.NextTick(() =>
             {
+                // Snap to the nearest clean orientation: floor (roll 0), wall upright (roll 90) or ceiling (roll 180)
+                float absRoll = MathF.Abs(data.Angles[2]);
                 data.Angles[0] = 0f;
-                data.Angles[2] = 0f;
+                data.Angles[2] = absRoll < 45f ? 0f : absRoll > 135f ? 180f : 90f;
                 Save();
                 UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, name);
+                OpenFineTuneMenu(player, data.Name);
             });
             return ValueTask.CompletedTask;
         };
@@ -2438,13 +3105,12 @@ public class WallTextModule
         var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
         backBtn.Click += (sender, args) =>
         {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, name));
+            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
             return ValueTask.CompletedTask;
         };
         builder.AddOption(backBtn);
 
         var menu = builder.Build();
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
+        ShowMenu(player, menu, name);
     }
 }

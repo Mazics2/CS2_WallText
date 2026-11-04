@@ -36,16 +36,14 @@ public class MapContext
     private void OnMapLoad(SwiftlyS2.Shared.Events.IOnMapLoadEvent @event)
     {
         var sanitized = Sanitize(@event.MapName);
-        if (string.Equals(sanitized, CurrentMap, StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
         CurrentMap = sanitized;
+
+        // Always invoke MapChanged on map load (even if reloading the same map),
+        // because Source 2 destroys all entities across map transitions.
         MapChanged?.Invoke();
     }
 
-    private void RefreshFromEngine()
+    public void RefreshFromEngine()
     {
         try
         {

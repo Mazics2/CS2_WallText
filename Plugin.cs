@@ -8,7 +8,7 @@ namespace CS2WallText;
     Id = "CS2_WallText",
     Version = "1.0.0",
     Name = "CS2 Wall Text",
-    Author = "CanDaysa",
+    Author = "surfevo",
     Description = "Per-map point_worldtext placement with precise trace-based aiming, a move/rotate menu, and EN/TR translations.")]
 public class WallTextPlugin(ISwiftlyCore core) : BasePlugin(core)
 {

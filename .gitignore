@@ -1,0 +1,32 @@
+## Build and Output Directories
+bin/
+obj/
+out/
+publish/
+
+## Visual Studio
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+
+## JetBrains Rider / VS Code
+.idea/
+.vscode/
+*.swp
+*.*~
+
+## .NET Core / Roslyn
+project.lock.json
+project.fragment.lock.json
+artifacts/
+*.log
+
+## OS Generated Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/

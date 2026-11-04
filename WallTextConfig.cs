@@ -9,6 +9,7 @@ public class WallTextConfig
     /// <summary>Empty string = no permission restriction. Defaults to CS2_Admin's root node so existing admins already have access.</summary>
     public string Permission { get; set; } = "admin.root";
 
+    public string DefaultFontName { get; set; } = "";
     public float DefaultFontSize { get; set; } = 24f;
     public float DefaultScale { get; set; } = 0.4f;
     public string DefaultColorHex { get; set; } = "#FFFFFF";
@@ -16,6 +17,7 @@ public class WallTextConfig
     public bool DefaultFullbright { get; set; } = true;
     public bool DefaultFacePlayer { get; set; } = false;
     public int DefaultJustifyHorizontal { get; set; } = 1;
+    public int DefaultJustifyVertical { get; set; } = 1;
     public float DefaultDepthOffset { get; set; } = 0.5f;
 
     /// <summary>Interval in seconds to update dynamic placeholders like {TIME}, {PLAYERS}. Set to 0 to disable dynamic updates.</summary>
@@ -60,9 +62,9 @@ public class WallTextConfig
         {
             ["en"] = new()
             {
-                ["chat.prefix"] = "[Lime]WallText[Default]",
+                ["chat.prefix"] = "[lime]WallText[default]",
                 ["chat.no_permission"] = "You do not have permission to use this command.",
-                ["chat.usage_general"] = "Usage: !text [add|edit|delete|list|tp|reload] <name>",
+                ["chat.usage_general"] = "Usage: !text [add|edit|delete|list|tp|reload|help] <name>",
                 ["chat.usage_add"] = "Usage: !text add <name>",
                 ["chat.usage_edit_cmd"] = "Usage: !text edit <name>",
                 ["chat.usage_delete"] = "Usage: !text delete <name>",
@@ -89,7 +91,7 @@ public class WallTextConfig
                 ["chat.color_changed"] = "Color changed to {0}.",
                 ["chat.invalid_color_hex"] = "Invalid HEX color format. Example: #FF0000 or #FFFFFF.",
                 ["chat.reloaded"] = "Configuration and world texts reloaded for map '{0}' ({1} loaded).",
-                ["chat.help_header"] = "--- [Lime]WallText Commands[Default] ---",
+                ["chat.help_header"] = "--- [lime]WallText Commands[default] ---",
                 ["chat.help_add"] = "!text add <name> - Create new text (aim & shoot)",
                 ["chat.help_edit"] = "!text edit <name> - Rename text",
                 ["chat.help_delete"] = "!text delete <name> - Delete text",
@@ -100,16 +102,20 @@ public class WallTextConfig
 
                 // Orientation & alignment
                 ["chat.moved_to_crosshair"] = "'{0}' moved and aligned upright at your crosshair.",
+                ["menu.option.orientation_menu"] = "Orientation & Quick Align",
+                ["menu.title.orientation"] = "Orientation: {0}",
                 ["menu.option.pitch_up"] = "Pitch Up / Stand Up (+90 deg)",
                 ["menu.option.pitch_down"] = "Pitch Down (-90 deg)",
                 ["menu.option.roll_rotate"] = "Roll Sideways (+90 deg)",
                 ["menu.option.preset_vertical"] = "Preset: Stand Up (Pitch 90 deg)",
                 ["menu.option.preset_vertical_neg"] = "Preset: Stand Up (Pitch -90 deg)",
-                ["menu.option.preset_flat"] = "Preset: Flat on Floor (Pitch 0 deg)",
+                ["menu.option.preset_wall_roll90"] = "Preset: Wall Upright (Roll 90 deg)",
+                ["menu.option.preset_flat"] = "Preset: Flat / Default (Pitch 0, Roll 0)",
                 ["menu.option.snap_upright"] = "Snap Upright (Pitch/Roll = 0)",
                 ["menu.option.rotate_90"] = "Rotate 90 deg Clockwise",
                 ["menu.option.flip_180"] = "Flip 180 deg (Reverse)",
-                ["menu.option.face_admin"] = "Face Towards Me",
+                ["menu.option.face_admin"] = "Face Towards Me (Horizontal)",
+                ["menu.option.face_admin_3d"] = "Face Towards My Eyes (3D)",
                 ["menu.option.move_to_crosshair"] = "Move to My Crosshair (Instant)",
 
                 // Rainbow
@@ -138,8 +144,9 @@ public class WallTextConfig
                 ["menu.option.set_interact_msg"] = "Set Player Message (via chat)",
                 ["menu.option.set_interact_cmd"] = "Set Command to Run (via chat)",
                 ["menu.option.interact_dist"] = "Max Distance: {0} units",
+                ["menu.option.interact_cooldown"] = "Cooldown: {0}s",
                 ["chat.enter_interact_msg"] = "Type message to show in player chat when clicked ('cancel' to abort):",
-                ["chat.enter_interact_cmd"] = "Type command to execute when clicked (e.g. 'say !vip' or 'server: give weapon_ak47', 'cancel' to abort):",
+                ["chat.enter_interact_cmd"] = "Type command to execute when clicked (e.g. '!vip', 'say !vip' or 'server: sv_cheats 1', 'cancel' to abort):",
                 ["chat.interact_msg_set"] = "Trigger message updated to: \"{0}\"",
                 ["chat.interact_cmd_set"] = "Trigger command updated to: \"{0}\"",
 
@@ -157,12 +164,16 @@ public class WallTextConfig
                 ["menu.option.rename"] = "Rename Id (type in chat)",
                 ["menu.option.change_text"] = "Change Text (type in chat)",
                 ["menu.option.color_menu"] = "Color ({0})",
+                ["menu.option.font"] = "Font: {0}",
                 ["menu.option.face_player"] = "Face Player (Billboard)",
                 ["menu.option.fullbright"] = "Fullbright",
-                ["menu.option.justify"] = "Alignment: {0}",
+                ["menu.option.justify"] = "Horizontal Align: {0}",
                 ["menu.option.justify_left"] = "Left",
                 ["menu.option.justify_center"] = "Center",
                 ["menu.option.justify_right"] = "Right",
+                ["menu.option.justify_vert"] = "Vertical Align: {0}",
+                ["menu.option.justify_bottom"] = "Bottom",
+                ["menu.option.justify_top"] = "Top",
                 ["menu.option.fine_tune"] = "Fine-Tune Position & Angles",
                 ["menu.option.position_x"] = "Move X",
                 ["menu.option.position_y"] = "Move Y",
@@ -192,6 +203,10 @@ public class WallTextConfig
                 ["menu.color.custom"] = "Custom HEX (type in chat)",
 
                 ["menu.title.fine_tune"] = "Fine-Tune: {0}",
+                ["menu.option.nudge_wall_right"] = "Slide Right along Wall (+{0})",
+                ["menu.option.nudge_wall_left"] = "Slide Left along Wall (-{0})",
+                ["menu.option.nudge_wall_out"] = "Pull Out from Wall (+{0})",
+                ["menu.option.nudge_wall_in"] = "Push In towards Wall (-{0})",
                 ["menu.option.nudge_x_pos"] = "Move +X (+{0})",
                 ["menu.option.nudge_x_neg"] = "Move -X (-{0})",
                 ["menu.option.nudge_y_pos"] = "Move +Y (+{0})",
@@ -204,14 +219,14 @@ public class WallTextConfig
                 ["menu.option.nudge_pitch_down"] = "Pitch Down (-{0} deg)",
                 ["menu.option.nudge_roll_pos"] = "Roll Right (+{0} deg)",
                 ["menu.option.nudge_roll_neg"] = "Roll Left (-{0} deg)",
-                ["menu.option.straighten"] = "Straighten (Reset Pitch/Roll to 0)",
+                ["menu.option.straighten"] = "Straighten (Snap to Wall / Floor)",
                 ["menu.option.step_size"] = "Step Size: {0} units",
             },
             ["tr"] = new()
             {
-                ["chat.prefix"] = "[Lime]WallText[Default]",
+                ["chat.prefix"] = "[lime]WallText[default]",
                 ["chat.no_permission"] = "Bu komutu kullanmak icin yetkiniz yok.",
-                ["chat.usage_general"] = "Kullanim: !text [add|edit|delete|list|tp|reload] <isim>",
+                ["chat.usage_general"] = "Kullanim: !text [add|edit|delete|list|tp|reload|help] <isim>",
                 ["chat.usage_add"] = "Kullanim: !text add <isim>",
                 ["chat.usage_edit_cmd"] = "Kullanim: !text edit <isim>",
                 ["chat.usage_delete"] = "Kullanim: !text delete <isim>",
@@ -238,7 +253,7 @@ public class WallTextConfig
                 ["chat.color_changed"] = "Renk {0} olarak ayarlandi.",
                 ["chat.invalid_color_hex"] = "Gecersiz HEX formati. Ornek: #FF0000 veya #FFFFFF.",
                 ["chat.reloaded"] = "Yapilandirma ve '{0}' haritasi metinleri yenilendi ({1} adet yuklendi).",
-                ["chat.help_header"] = "--- [Lime]WallText Komutlari[Default] ---",
+                ["chat.help_header"] = "--- [lime]WallText Komutlari[default] ---",
                 ["chat.help_add"] = "!text add <isim> - Yeni metin olustur (bak ve ates et)",
                 ["chat.help_edit"] = "!text edit <isim> - Metin ismini degistir",
                 ["chat.help_delete"] = "!text delete <isim> - Metni sil",
@@ -249,16 +264,20 @@ public class WallTextConfig
 
                 // Orientation & alignment
                 ["chat.moved_to_crosshair"] = "'{0}' baktiginiz duvara dik olarak tasindi.",
+                ["menu.option.orientation_menu"] = "Yön & Hızlı Açı Araçları",
+                ["menu.title.orientation"] = "Yön & Hizalama: {0}",
                 ["menu.option.pitch_up"] = "Yukarı Kaldır / Dik Yap (Pitch +90 der)",
                 ["menu.option.pitch_down"] = "Aşağı Yatır (Pitch -90 der)",
                 ["menu.option.roll_rotate"] = "Yan Yatır (Roll +90 der)",
                 ["menu.option.preset_vertical"] = "Ayaklandır: Dik (Pitch 90 der)",
                 ["menu.option.preset_vertical_neg"] = "Ayaklandır: Dik (Pitch -90 der)",
-                ["menu.option.preset_flat"] = "Zemine Yatır: Düz (Pitch 0 der)",
+                ["menu.option.preset_wall_roll90"] = "Duvara Dik: Standart (Roll 90 der)",
+                ["menu.option.preset_flat"] = "Zemine Yatır: Düz (Pitch 0, Roll 0)",
                 ["menu.option.snap_upright"] = "Duvara Dik Yap (Pitch/Roll = 0)",
                 ["menu.option.rotate_90"] = "90 der Sağa Çevir (+90 der)",
                 ["menu.option.flip_180"] = "180 der Tersine Çevir",
-                ["menu.option.face_admin"] = "Yüzünü Bana Çevir",
+                ["menu.option.face_admin"] = "Yüzünü Bana Çevir (Yatay)",
+                ["menu.option.face_admin_3d"] = "Bakış Açıma Tam Hizala (3D)",
                 ["menu.option.move_to_crosshair"] = "Baktığım Duvara Taşı (Anında)",
 
                 // Rainbow
@@ -287,8 +306,9 @@ public class WallTextConfig
                 ["menu.option.set_interact_msg"] = "Oyuncuya Mesaj Ayarla (Sohbetten)",
                 ["menu.option.set_interact_cmd"] = "Çalışacak Komutu Ayarla (Sohbetten)",
                 ["menu.option.interact_dist"] = "Maks Mesafe: {0} birim",
+                ["menu.option.interact_cooldown"] = "Bekleme Süresi: {0} sn",
                 ["chat.enter_interact_msg"] = "Yazıya basıldığında oyuncunun sohbetine gidecek mesajı yazın ('cancel' ile iptal):",
-                ["chat.enter_interact_cmd"] = "Yazıya basıldığında çalışacak komutu yazın (Örn: 'say !vip' veya 'server: give weapon_ak47', iptal için 'cancel'):",
+                ["chat.enter_interact_cmd"] = "Yazıya basıldığında çalışacak komutu yazın (Örn: '!vip', 'say !vip' veya 'server: give weapon_ak47', iptal için 'cancel'):",
                 ["chat.interact_msg_set"] = "Tetikleme mesajı güncellendi: \"{0}\"",
                 ["chat.interact_cmd_set"] = "Tetikleme komutu güncellendi: \"{0}\"",
 
@@ -306,12 +326,16 @@ public class WallTextConfig
                 ["menu.option.rename"] = "Id'yi Yeniden Adlandir (sohbete yaz)",
                 ["menu.option.change_text"] = "Metni Degistir (sohbete yaz)",
                 ["menu.option.color_menu"] = "Renk ({0})",
+                ["menu.option.font"] = "Yazı Tipi: {0}",
                 ["menu.option.face_player"] = "Oyuncuya Don (Billboard)",
                 ["menu.option.fullbright"] = "Fullbright (Parlaklik)",
-                ["menu.option.justify"] = "Hizalama: {0}",
+                ["menu.option.justify"] = "Yatay Hizalama: {0}",
                 ["menu.option.justify_left"] = "Sol",
                 ["menu.option.justify_center"] = "Orta",
                 ["menu.option.justify_right"] = "Sag",
+                ["menu.option.justify_vert"] = "Dikey Hizalama: {0}",
+                ["menu.option.justify_bottom"] = "Alt",
+                ["menu.option.justify_top"] = "Üst",
                 ["menu.option.fine_tune"] = "Hassas Konum & Aci Ayari",
                 ["menu.option.position_x"] = "X Ekseninde Kaydir",
                 ["menu.option.position_y"] = "Y Ekseninde Kaydir",
@@ -341,6 +365,10 @@ public class WallTextConfig
                 ["menu.color.custom"] = "Ozel HEX Gir (Sohbetten)",
 
                 ["menu.title.fine_tune"] = "Hassas Ayar: {0}",
+                ["menu.option.nudge_wall_right"] = "Duvara Göre Sağa Kaydır (+{0})",
+                ["menu.option.nudge_wall_left"] = "Duvara Göre Sola Kaydır (-{0})",
+                ["menu.option.nudge_wall_out"] = "Duvardan Dışarı Çek (+{0})",
+                ["menu.option.nudge_wall_in"] = "Duvara Doğru İt (-{0})",
                 ["menu.option.nudge_x_pos"] = "+X Kaydir (+{0})",
                 ["menu.option.nudge_x_neg"] = "-X Kaydir (-{0})",
                 ["menu.option.nudge_y_pos"] = "+Y Kaydir (+{0})",
@@ -353,7 +381,7 @@ public class WallTextConfig
                 ["menu.option.nudge_pitch_down"] = "Aşağı Yatır (-{0} der Pitch)",
                 ["menu.option.nudge_roll_pos"] = "Sağa Yatır (+{0} der Roll)",
                 ["menu.option.nudge_roll_neg"] = "Sola Yatır (-{0} der Roll)",
-                ["menu.option.straighten"] = "Duzlestir (Pitch/Roll Sifirla)",
+                ["menu.option.straighten"] = "Duzlestir (Duvara / Zemine Hizala)",
                 ["menu.option.step_size"] = "Ayar Adimi: {0} birim",
             },
         };
