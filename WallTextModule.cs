@@ -4,6 +4,7 @@ using System.IO;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using MenuApi.API;
 using Microsoft.Extensions.Logging;
 using SwiftlyS2.Core.Menus.OptionsBase;
 using SwiftlyS2.Shared;
@@ -38,6 +39,8 @@ public class WallTextModule
 
     private readonly ISwiftlyCore _core;
     private readonly MapContext _mapContext;
+
+    public IMenuApi? MenuApi { get; set; }
 
     private WallTextConfig _config = new();
     private string _configPath = "";
@@ -1837,6 +1840,10 @@ public class WallTextModule
 
     private void CloseMenu(IPlayer player)
     {
+        if (MenuApi != null && MenuApi.HasActiveMenu(player))
+        {
+            MenuApi.CloseMenu(player);
+        }
         var current = _core.MenusAPI.GetCurrentMenu(player);
         if (current != null)
         {
@@ -1852,6 +1859,10 @@ public class WallTextModule
             {
                 if (player != null && player.IsValid && !player.IsFakeClient)
                 {
+                    if (MenuApi != null && MenuApi.HasActiveMenu(player))
+                    {
+                        MenuApi.CloseMenu(player);
+                    }
                     var current = _core.MenusAPI.GetCurrentMenu(player);
                     if (current != null && string.Equals(current.Tag as string, MenuTag, StringComparison.Ordinal))
                     {
@@ -1878,8 +1889,54 @@ public class WallTextModule
         return candidate;
     }
 
+    private MenuApi.API.IMenuBuilder CreateMenuApiBuilder(string id, string title, string? subtitle = null)
+    {
+        var b = MenuApi!.CreateBuilder(id, title)
+            .SetTheme(MenuTheme.Blue)
+            .SetItemsPerPage(7)
+            .SetTimeout(TimeSpan.FromSeconds(60))
+            .EnableSounds(true)
+            .EnableSlotSelection(true)
+            .EnableChatSelection(true);
+
+        if (!string.IsNullOrWhiteSpace(subtitle))
+            b.SetSubtitle(subtitle);
+
+        return b;
+    }
+
     private void OpenMainMenu(IPlayer player)
     {
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.main.{player.Slot}", $"✦ {T("menu.title.main")} ✦", $"Harita: {_mapContext.CurrentMap} • Kayıtlı: {_store.Count}");
+            b.AddItem($"➕ {T("menu.option.create")}", ctx =>
+            {
+                _core.Scheduler.NextTick(() => BeginCreate(ctx.Player, GenerateUniqueDefaultName()));
+            }, "#4ADE80", closeOnSelect: true);
+
+            b.AddItem("⚡ Hazır Şablon ile Oluştur (5 Şablon)", ctx =>
+            {
+                OpenTemplatesMenu(ctx.Player);
+            }, "#38BDF8", closeOnSelect: false);
+
+            b.AddItem($"📁 {T("menu.option.manage")} ({_store.Count})", ctx =>
+            {
+                OpenListMenu(ctx.Player);
+            }, "#FACC15", closeOnSelect: false);
+
+            b.AddItem("🔄 Harita Yazılarını Yeniden Yükle", ctx =>
+            {
+                LoadConfig();
+                ReloadForCurrentMap();
+                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.reloaded", _mapContext.CurrentMap, _store.Count)}");
+                OpenMainMenu(ctx.Player);
+            }, "#CBD5E1", closeOnSelect: false);
+
+            b.Open(player, 0);
+            return;
+        }
+
         var builder = _core.MenusAPI.CreateBuilder();
         builder.Design.SetMenuTitle(T("menu.title.main"));
 
@@ -1903,8 +1960,90 @@ public class WallTextModule
         ShowMenu(player, menu, "");
     }
 
+    private void OpenTemplatesMenu(IPlayer player)
+    {
+        if (MenuApi == null) return;
+
+        var b = CreateMenuApiBuilder($"wt.templates.{player.Slot}", "✦ HAZIR DUVAR YAZISI ŞABLONLARI ✦", "Seçtikten sonra duvara ateş ederek yerleştirin");
+
+        var templates = new (string Label, string Text, string Color, bool Rainbow, float FontSize)[]
+        {
+            ("💬 Discord Topluluk Panosu", "✦ DISCORD TOPLULUĞUMUZ ✦\ndiscord.gg/sunucu", "#38BDF8", false, 36f),
+            ("👑 Hoş Geldiniz & Sunucu Panosu", "★ {SERVER_NAME} ★\nHarita: {MAP} | Oyuncu: {PLAYERS}/{MAXPLAYERS}", "#FFD700", true, 38f),
+            ("⚖️ Sunucu Kuralları Panosu", "⚖ SUNUCU KURALLARI ⚖\n1. Hile ve 3. Parti Yazılım Yasaktır\n2. Küfür ve Hakaret Yasaktır\n3. İyi Oyunlar!", "#FF3333", false, 30f),
+            ("🕒 Canlı Saat & Tarih Panosu", "🕒 SAAT: {TIME}\n📅 TARİH: {DATE}", "#33FF33", false, 34f),
+            ("🎁 Etkileşimli VIP Bilgi Butonu (+USE)", "★ VIP BİLGİ ★\n[E] Tuşuna Basarak İnceleyin!", "#DA70D6", true, 34f)
+        };
+
+        for (int i = 0; i < templates.Length; i++)
+        {
+            var tpl = templates[i];
+            int idx = i;
+            b.AddItem(tpl.Label, ctx =>
+            {
+                var p = ctx.Player;
+                string name = GenerateUniqueDefaultName();
+                CloseMenu(p);
+                SendColoredChat(p, $"{Prefix()} {T("chat.capturing_point", name)}");
+                BeginPointCapture(p, (adm, point, normal) =>
+                {
+                    var placedPos = point + normal * WallOffset;
+                    var angle = CalculateWallAngles(normal, adm.PlayerPawn?.EyeAngles ?? default);
+                    var data = new WallTextData
+                    {
+                        Name = name,
+                        Text = tpl.Text,
+                        Position = [placedPos.X, placedPos.Y, placedPos.Z],
+                        Angles = [angle.Pitch, angle.Yaw, angle.Roll],
+                        Enabled = true,
+                        ColorHex = tpl.Color,
+                        Rainbow = tpl.Rainbow,
+                        FontSize = tpl.FontSize,
+                        Scale = 0.25f,
+                        Fullbright = true,
+                        IsInteractable = idx == 4,
+                        TriggerType = "use",
+                        MessageToPlayer = idx == 4 ? "[gold]★ VIP Ayrıcalıkları için Discord sunucumuza katılın![default]" : ""
+                    };
+                    _store[name] = data;
+                    Save();
+                    SpawnEntity(data);
+                    SendColoredChat(adm, $"{Prefix()} {T("chat.created", name, data.Text.Replace("\n", " "))}");
+                    _core.Scheduler.NextTick(() => OpenDetailMenu(adm, name));
+                });
+            }, "#4ADE80", closeOnSelect: true);
+        }
+
+        b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenMainMenu(ctx.Player), "#FFB000", closeOnSelect: false);
+        b.Open(player, 0);
+    }
+
     private void OpenListMenu(IPlayer player)
     {
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.list.{player.Slot}", $"✦ {T("menu.title.list")} ✦", $"Toplam {_store.Count} Duvar Yazısı");
+            if (_store.Count == 0)
+            {
+                b.AddText(T("menu.option.no_items"), "#94A3B8");
+            }
+            else
+            {
+                foreach (var name in new List<string>(_store.Keys))
+                {
+                    var capturedName = name;
+                    var data = _store[name];
+                    string preview = data.Text.Replace("\n", " ");
+                    if (preview.Length > 20) preview = preview[..17] + "...";
+                    var label = $"{data.Name}: \"{preview}\" [{(data.Enabled ? "ON" : "OFF")}]";
+                    b.AddItem(label, ctx => OpenDetailMenu(ctx.Player, capturedName), data.Enabled ? "#4ADE80" : "#F87171", closeOnSelect: false);
+                }
+            }
+            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenMainMenu(ctx.Player), "#FFB000", closeOnSelect: false);
+            b.Open(player, 0);
+            return;
+        }
+
         var builder = _core.MenusAPI.CreateBuilder();
         builder.Design.SetMenuTitle(T("menu.title.list"));
 
@@ -1943,12 +2082,174 @@ public class WallTextModule
         ShowMenu(player, menu, "");
     }
 
-    private void OpenDetailMenu(IPlayer player, string name)
+    private void OpenDetailMenu(IPlayer player, string name, int pageIdx = 0)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
+            return;
+        }
+
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.detail.{player.Slot}", $"✦ {data.Name} ✦", $"[P:{data.Angles[0]:0}° Y:{data.Angles[1]:0}° R:{data.Angles[2]:0}°] • Boyut: {data.FontSize:0}");
+
+            b.AddItem($"{T("menu.option.enabled")}: [{(data.Enabled ? "AKTİF" : "KAPALI")}]", ctx =>
+            {
+                data.Enabled = !data.Enabled;
+                Save();
+                if (data.Enabled) SpawnEntity(data);
+                else DespawnEntity(data.Name);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, data.Enabled ? "#4ADE80" : "#F87171", closeOnSelect: false);
+
+            b.AddItem($"🎯 {T("menu.option.move_to_crosshair")}", ctx =>
+            {
+                MoveToCrosshair(ctx.Player, data.Name);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#38BDF8", closeOnSelect: false);
+
+            b.AddItem($"🧭 {T("menu.option.orientation_menu")}", ctx =>
+            {
+                OpenOrientationMenu(ctx.Player, data.Name);
+            }, "#FACC15", closeOnSelect: false);
+
+            b.AddItem($"📐 {T("menu.option.fine_tune")}", ctx =>
+            {
+                OpenFineTuneMenu(ctx.Player, data.Name);
+            }, "#FACC15", closeOnSelect: false);
+
+            b.AddItem($"✏️ {T("menu.option.change_text")}", ctx =>
+            {
+                SetPendingChat(ctx.Player, ChatPromptKind.ChangeText, data.Name);
+                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_text")}");
+            }, "#38BDF8", closeOnSelect: true);
+
+            b.AddItem($"🎨 {T("menu.option.color_menu", data.ColorHex)}", ctx =>
+            {
+                OpenColorMenu(ctx.Player, data.Name);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem($"🌈 {T("menu.option.rainbow", data.Rainbow ? "ON" : "OFF")}", ctx =>
+            {
+                data.Rainbow = !data.Rainbow;
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, data.Rainbow ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
+
+            if (data.Rainbow)
+            {
+                b.AddItem($"⚡ {T("menu.option.rainbow_speed", data.RainbowSpeed)}", ctx =>
+                {
+                    data.RainbowSpeed = data.RainbowSpeed switch
+                    {
+                        <= 0.5f => 1.0f,
+                        <= 1.0f => 2.0f,
+                        <= 2.0f => 0.5f,
+                        _ => 1.0f
+                    };
+                    Save();
+                    OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+                }, "#FACC15", closeOnSelect: false);
+            }
+
+            b.AddItem($"🔄 {T("menu.option.rotating_menu", data.RotatingMessages.Count)}", ctx =>
+            {
+                OpenRotatingMenu(ctx.Player, data.Name);
+            }, "#38BDF8", closeOnSelect: false);
+
+            b.AddItem($"🔘 {T("menu.option.interact_menu")}", ctx =>
+            {
+                OpenInteractMenu(ctx.Player, data.Name);
+            }, "#38BDF8", closeOnSelect: false);
+
+            string fLabel = string.IsNullOrWhiteSpace(data.FontName) ? "Default" : data.FontName;
+            b.AddItem($"🔤 {T("menu.option.font", fLabel)}", ctx =>
+            {
+                int curIdx = Array.IndexOf(AvailableFonts, data.FontName ?? "");
+                int nextIdx = (curIdx + 1) % AvailableFonts.Length;
+                data.FontName = AvailableFonts[nextIdx];
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem($"📏 {T("menu.option.font_size")}: [{data.FontSize:0}] (+4)", ctx =>
+            {
+                data.FontSize = data.FontSize >= 72f ? 12f : data.FontSize + 4f;
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem($"🔍 {T("menu.option.scale")}: [{data.Scale:0.00}]", ctx =>
+            {
+                float[] scales = [0.10f, 0.15f, 0.20f, 0.25f, 0.35f, 0.50f, 0.75f, 1.00f];
+                int idx = Array.FindIndex(scales, s => MathF.Abs(s - data.Scale) < 0.02f);
+                data.Scale = scales[(idx + 1) % scales.Length];
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem($"👁️ {T("menu.option.face_player")}: [{(data.FacePlayer ? "AKTİF" : "KAPALI")}]", ctx =>
+            {
+                data.FacePlayer = !data.FacePlayer;
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, data.FacePlayer ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
+
+            b.AddItem($"💡 {T("menu.option.fullbright")}: [{(data.Fullbright ? "AKTİF" : "KAPALI")}]", ctx =>
+            {
+                data.Fullbright = !data.Fullbright;
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, data.Fullbright ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
+
+            b.AddItem($"🖼️ {T("menu.option.background")}: [{(data.Background ? "AKTİF" : "KAPALI")}]", ctx =>
+            {
+                data.Background = !data.Background;
+                Save();
+                UpdateLiveEntity(data);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, data.Background ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
+
+            b.AddItem($"⚡ {T("menu.option.teleport")}", ctx =>
+            {
+                TeleportToText(ctx.Player, data.Name);
+                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#38BDF8", closeOnSelect: false);
+
+            b.AddItem($"🎯 {T("menu.option.reaim")}", ctx =>
+            {
+                BeginReaim(ctx.Player, data.Name);
+            }, "#38BDF8", closeOnSelect: true);
+
+            b.AddItem($"📋 {T("menu.option.duplicate")}", ctx =>
+            {
+                BeginDuplicate(ctx.Player, data.Name);
+            }, "#4ADE80", closeOnSelect: true);
+
+            b.AddItem($"✏️ {T("menu.option.rename")}", ctx =>
+            {
+                BeginRename(ctx.Player, data.Name);
+            }, "#FACC15", closeOnSelect: true);
+
+            b.AddItem($"🗑️ {T("menu.option.delete")}", ctx =>
+            {
+                DespawnEntity(data.Name);
+                _store.Remove(data.Name);
+                Save();
+                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.deleted", data.Name)}");
+                OpenListMenu(ctx.Player);
+            }, "#F87171", closeOnSelect: false);
+
+            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenListMenu(ctx.Player), "#FFB000", closeOnSelect: false);
+            b.Open(player, pageIdx);
             return;
         }
 
@@ -2260,12 +2561,103 @@ public class WallTextModule
     // Sub-Menu: Orientation & Quick Alignment Tools
     // ------------------------------------------------------------------
 
-    private void OpenOrientationMenu(IPlayer player, string name)
+    private void OpenOrientationMenu(IPlayer player, string name, int pageIdx = 0)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
+            return;
+        }
+
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.orient.{player.Slot}", $"✦ YÖN & HİZALAMA: {data.Name} ✦", $"[P:{data.Angles[0]:0}° Y:{data.Angles[1]:0}° R:{data.Angles[2]:0}°]");
+
+            b.AddItem(T("menu.option.move_to_crosshair"), ctx =>
+            {
+                MoveToCrosshair(ctx.Player, data.Name, returnToOrientationMenu: true);
+            }, "#38BDF8", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.face_admin"), ctx =>
+            {
+                if (ctx.Player.PlayerPawn != null && ctx.Player.PlayerPawn.AbsOrigin.HasValue)
+                {
+                    var pPos = ctx.Player.PlayerPawn.AbsOrigin.Value;
+                    float dx = pPos.X - data.Position[0];
+                    float dy = pPos.Y - data.Position[1];
+                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, 0f, keepUpright: true);
+                    data.Angles[0] = fp; data.Angles[1] = fy; data.Angles[2] = fr;
+                    Save(); UpdateLiveEntity(data);
+                }
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#4ADE80", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.face_admin_3d"), ctx =>
+            {
+                if (ctx.Player.PlayerPawn != null && TryGetEyePosition(ctx.Player.PlayerPawn, out var eyePos))
+                {
+                    float dx = eyePos.X - data.Position[0];
+                    float dy = eyePos.Y - data.Position[1];
+                    float dz = eyePos.Z - data.Position[2];
+                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, dz, keepUpright: false);
+                    data.Angles[0] = fp; data.Angles[1] = fy; data.Angles[2] = fr;
+                    Save(); UpdateLiveEntity(data);
+                }
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#4ADE80", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.flip_180"), ctx =>
+            {
+                data.Angles[1] = NormalizeAngle(data.Angles[1] + 180f);
+                Save(); UpdateLiveEntity(data);
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.rotate_90"), ctx =>
+            {
+                data.Angles[1] = NormalizeAngle(data.Angles[1] + 90f);
+                Save(); UpdateLiveEntity(data);
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.pitch_up"), ctx =>
+            {
+                data.Angles[0] = NormalizeAngle(data.Angles[0] + 90f);
+                Save(); UpdateLiveEntity(data);
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.pitch_down"), ctx =>
+            {
+                data.Angles[0] = NormalizeAngle(data.Angles[0] - 90f);
+                Save(); UpdateLiveEntity(data);
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.roll_rotate"), ctx =>
+            {
+                data.Angles[2] = NormalizeAngle(data.Angles[2] + 90f);
+                Save(); UpdateLiveEntity(data);
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.preset_wall_roll90"), ctx =>
+            {
+                data.Angles[0] = 0f; data.Angles[2] = 90f;
+                Save(); UpdateLiveEntity(data);
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#FACC15", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.preset_flat"), ctx =>
+            {
+                data.Angles[0] = 0f; data.Angles[2] = 0f;
+                Save(); UpdateLiveEntity(data);
+                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#FACC15", closeOnSelect: false);
+
+            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
+            b.Open(player, pageIdx);
             return;
         }
 
@@ -2481,12 +2873,70 @@ public class WallTextModule
     // Sub-Menu: Rotating Announcer Board
     // ------------------------------------------------------------------
 
-    private void OpenRotatingMenu(IPlayer player, string name)
+    private void OpenRotatingMenu(IPlayer player, string name, int pageIdx = 0)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
+            return;
+        }
+
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.rot.{player.Slot}", $"✦ DÖNÜŞÜMLÜ DUYURU: {data.Name} ✦", $"Kayıtlı Mesaj: {data.RotatingMessages.Count}");
+            b.AddItem($"{T("menu.option.rotating_toggle")}: [{(data.IsRotating ? "AKTİF" : "KAPALI")}]", ctx =>
+            {
+                data.IsRotating = !data.IsRotating;
+                Save(); UpdateLiveEntity(data);
+                OpenRotatingMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, data.IsRotating ? "#4ADE80" : "#F87171", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.rotating_interval", (int)data.RotationIntervalSeconds), ctx =>
+            {
+                data.RotationIntervalSeconds = data.RotationIntervalSeconds switch
+                {
+                    <= 5f => 10f, <= 10f => 20f, <= 20f => 30f, <= 30f => 60f, _ => 5f
+                };
+                Save();
+                OpenRotatingMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#FACC15", closeOnSelect: false);
+
+            b.AddItem($"➕ {T("menu.option.add_rotating_msg")}", ctx =>
+            {
+                SetPendingChat(ctx.Player, ChatPromptKind.AddRotatingMessage, data.Name);
+                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_rotating_message")}");
+            }, "#38BDF8", closeOnSelect: true);
+
+            if (data.RotatingMessages.Count > 0)
+            {
+                b.AddItem($"🗑️ {T("menu.option.clear_rotating_msgs")}", ctx =>
+                {
+                    data.RotatingMessages.Clear();
+                    data.IsRotating = false;
+                    Save(); UpdateLiveEntity(data);
+                    SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.rotating_messages_cleared", data.Name)}");
+                    OpenRotatingMenu(ctx.Player, data.Name, 0);
+                }, "#F87171", closeOnSelect: false);
+
+                for (int i = 0; i < data.RotatingMessages.Count; i++)
+                {
+                    int index = i;
+                    string preview = data.RotatingMessages[index].Replace("\n", " ");
+                    if (preview.Length > 28) preview = preview[..25] + "...";
+                    b.AddItem($"#{index + 1}: {preview} [Sil]", ctx =>
+                    {
+                        if (index >= 0 && index < data.RotatingMessages.Count)
+                            data.RotatingMessages.RemoveAt(index);
+                        if (data.RotatingMessages.Count == 0) data.IsRotating = false;
+                        Save(); UpdateLiveEntity(data);
+                        OpenRotatingMenu(ctx.Player, data.Name, ctx.PageIndex);
+                    }, "#E2E8F0", closeOnSelect: false);
+                }
+            }
+
+            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
+            b.Open(player, pageIdx);
             return;
         }
 
@@ -2602,12 +3052,80 @@ public class WallTextModule
     // Sub-Menu: Interactive Trigger
     // ------------------------------------------------------------------
 
-    private void OpenInteractMenu(IPlayer player, string name)
+    private void OpenInteractMenu(IPlayer player, string name, int pageIdx = 0)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
+            return;
+        }
+
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.interact.{player.Slot}", $"✦ ETKİLEŞİMLİ BUTON: {data.Name} ✦", "+USE (E) veya Ateş Tetikleyici");
+
+            b.AddItem($"{T("menu.option.interact_toggle")}: [{(data.IsInteractable ? "AKTİF" : "KAPALI")}]", ctx =>
+            {
+                data.IsInteractable = !data.IsInteractable;
+                Save();
+                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, data.IsInteractable ? "#4ADE80" : "#F87171", closeOnSelect: false);
+
+            string tLabel = data.TriggerType.ToLowerInvariant() switch
+            {
+                "use" => T("trigger.type.use"),
+                "shoot" => T("trigger.type.shoot"),
+                _ => T("trigger.type.both")
+            };
+            b.AddItem(T("menu.option.interact_trigger_type", tLabel), ctx =>
+            {
+                data.TriggerType = data.TriggerType.ToLowerInvariant() switch
+                {
+                    "both" => "use", "use" => "shoot", _ => "both"
+                };
+                Save();
+                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#FACC15", closeOnSelect: false);
+
+            string cMsg = string.IsNullOrWhiteSpace(data.MessageToPlayer) ? "Yok" : data.MessageToPlayer.Replace("\n", " ");
+            if (cMsg.Length > 20) cMsg = cMsg[..17] + "...";
+            b.AddItem($"{T("menu.option.set_interact_msg")} [{cMsg}]", ctx =>
+            {
+                SetPendingChat(ctx.Player, ChatPromptKind.InteractMessage, data.Name);
+                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_interact_msg")}");
+            }, "#38BDF8", closeOnSelect: true);
+
+            string cCmd = string.IsNullOrWhiteSpace(data.CommandToRun) ? "Yok" : data.CommandToRun;
+            if (cCmd.Length > 20) cCmd = cCmd[..17] + "...";
+            b.AddItem($"{T("menu.option.set_interact_cmd")} [{cCmd}]", ctx =>
+            {
+                SetPendingChat(ctx.Player, ChatPromptKind.InteractCommand, data.Name);
+                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_interact_cmd")}");
+            }, "#38BDF8", closeOnSelect: true);
+
+            b.AddItem(T("menu.option.interact_dist", (int)data.InteractionDistance), ctx =>
+            {
+                data.InteractionDistance = data.InteractionDistance switch
+                {
+                    <= 150f => 250f, <= 250f => 400f, <= 400f => 600f, _ => 150f
+                };
+                Save();
+                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.interact_cooldown", data.CooldownSeconds), ctx =>
+            {
+                data.CooldownSeconds = data.CooldownSeconds switch
+                {
+                    <= 0.5f => 1.0f, <= 1.0f => 2.0f, <= 2.0f => 5.0f, <= 5.0f => 10.0f, _ => 0.5f
+                };
+                Save();
+                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
+            b.Open(player, pageIdx);
             return;
         }
 
@@ -2739,12 +3257,55 @@ public class WallTextModule
     // Sub-Menu: Color Selection
     // ------------------------------------------------------------------
 
-    private void OpenColorMenu(IPlayer player, string name)
+    private void OpenColorMenu(IPlayer player, string name, int pageIdx = 0)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
             OpenListMenu(player);
+            return;
+        }
+
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.color.{player.Slot}", $"✦ RENK SEÇİMİ: {data.Name} ✦", $"Mevcut: {data.ColorHex}");
+            var colorPresets = new (string Key, string Hex)[]
+            {
+                ("menu.color.white", "#FFFFFF"),
+                ("menu.color.red", "#FF3333"),
+                ("menu.color.green", "#33FF33"),
+                ("menu.color.blue", "#3388FF"),
+                ("menu.color.yellow", "#FFFF33"),
+                ("menu.color.cyan", "#00FFFF"),
+                ("menu.color.orange", "#FFA500"),
+                ("menu.color.magenta", "#DA70D6"),
+                ("menu.color.gold", "#FFD700"),
+                ("menu.color.pink", "#FF69B4"),
+                ("menu.color.lime", "#32CD32"),
+                ("menu.color.grey", "#888888"),
+            };
+
+            foreach (var (presetKey, hex) in colorPresets)
+            {
+                var capturedHex = hex;
+                b.AddItem($"{T(presetKey)} ({capturedHex})", ctx =>
+                {
+                    data.ColorHex = capturedHex;
+                    data.Rainbow = false;
+                    Save(); UpdateLiveEntity(data);
+                    SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.color_changed", capturedHex)}");
+                    OpenColorMenu(ctx.Player, data.Name, ctx.PageIndex);
+                }, capturedHex, closeOnSelect: false);
+            }
+
+            b.AddItem($"✏️ {T("menu.color.custom")}", ctx =>
+            {
+                SetPendingChat(ctx.Player, ChatPromptKind.ColorHex, data.Name);
+                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_color_hex")}");
+            }, "#38BDF8", closeOnSelect: true);
+
+            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
+            b.Open(player, pageIdx);
             return;
         }
 
@@ -2815,7 +3376,7 @@ public class WallTextModule
     // Sub-Menu: Fine-Tune Position & Angles
     // ------------------------------------------------------------------
 
-    private void OpenFineTuneMenu(IPlayer player, string name)
+    private void OpenFineTuneMenu(IPlayer player, string name, int pageIdx = 0)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
@@ -2828,6 +3389,124 @@ public class WallTextModule
         {
             step = 5f;
             _playerStepSizes[player.Slot] = step;
+        }
+
+        if (MenuApi != null)
+        {
+            var b = CreateMenuApiBuilder($"wt.finetune.{player.Slot}", $"✦ HASSAS AYAR: {data.Name} ✦", $"Adım: {step:0} birim/derece");
+
+            b.AddItem($"📏 {T("menu.option.step_size", step)}", ctx =>
+            {
+                int curIdx = Array.IndexOf(AvailableSteps, step);
+                int nextIdx = (curIdx + 1) % AvailableSteps.Length;
+                _playerStepSizes[ctx.Player.Slot] = AvailableSteps[nextIdx];
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#FACC15", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_wall_right", step), ctx =>
+            {
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                data.Position[0] += -MathF.Sin(yawRad) * step;
+                data.Position[1] += MathF.Cos(yawRad) * step;
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#38BDF8", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_wall_left", step), ctx =>
+            {
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                data.Position[0] -= -MathF.Sin(yawRad) * step;
+                data.Position[1] -= MathF.Cos(yawRad) * step;
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#38BDF8", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_z_up", step), ctx =>
+            {
+                data.Position[2] += step;
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#4ADE80", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_z_down", step), ctx =>
+            {
+                data.Position[2] -= step;
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#4ADE80", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_wall_out", step), ctx =>
+            {
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                data.Position[0] += MathF.Cos(yawRad) * step;
+                data.Position[1] += MathF.Sin(yawRad) * step;
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_wall_in", step), ctx =>
+            {
+                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
+                data.Position[0] -= MathF.Cos(yawRad) * step;
+                data.Position[1] -= MathF.Sin(yawRad) * step;
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_pitch_up", step), ctx =>
+            {
+                data.Angles[0] = NormalizeAngle(data.Angles[0] + step);
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_pitch_down", step), ctx =>
+            {
+                data.Angles[0] = NormalizeAngle(data.Angles[0] - step);
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_yaw_left", step), ctx =>
+            {
+                data.Angles[1] = NormalizeAngle(data.Angles[1] - step);
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_yaw_right", step), ctx =>
+            {
+                data.Angles[1] = NormalizeAngle(data.Angles[1] + step);
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_roll_pos", step), ctx =>
+            {
+                data.Angles[2] = NormalizeAngle(data.Angles[2] + step);
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.nudge_roll_neg", step), ctx =>
+            {
+                data.Angles[2] = NormalizeAngle(data.Angles[2] - step);
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#E2E8F0", closeOnSelect: false);
+
+            b.AddItem(T("menu.option.straighten"), ctx =>
+            {
+                float absRoll = MathF.Abs(data.Angles[2]);
+                data.Angles[0] = 0f;
+                data.Angles[2] = absRoll < 45f ? 0f : absRoll > 135f ? 180f : 90f;
+                Save(); UpdateLiveEntity(data);
+                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
+            }, "#4ADE80", closeOnSelect: false);
+
+            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
+            b.Open(player, pageIdx);
+            return;
         }
 
         var builder = _core.MenusAPI.CreateBuilder();

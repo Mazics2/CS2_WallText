@@ -1,0 +1,31 @@
+================================================================================
+                    CS2_WALLTEXT - 3D DÜNYA DUVAR YAZILARI
+                           YAPILMASI GEREKENLER & ENTEGRASYON
+================================================================================
+Eklenti: CS2_WallText (v1.0.0)
+Repo: https://github.com/Mazics2/CS2_WallText.git
+
+--------------------------------------------------------------------------------
+1. DURUM & ENTEGRASYON
+--------------------------------------------------------------------------------
+[✓] 1. 3D Dünya Üzerinde Dinamik Metinler:
+    - Haritanın istenilen zemin veya duvar koordinatlarına 3D point_worldtext entity'leri basar.
+    - {PLAYERNAME}, {IP}, {TIME}, {MAP} değişken yer tutucuları desteklenir.
+
+[✓] 2. MenuApi Entegrasyonu:
+    - SwiftlyS2-MenuApi arayüzüne başarıyla bağlanır.
+    - `!walltext` veya `!yazi` menüsü ile harita üzerinde yazı ekleme/düzenleme/silme imkanı sunar.
+
+--------------------------------------------------------------------------------
+2. KOMUTLAR
+--------------------------------------------------------------------------------
+* `!walltext` / `!yazi` : Duvar yazısı yönetim menüsü (Admin).
+* `sw_walltext_add <metin>` : Baktığınız noktaya 3D metin ekler.
+* `sw_walltext_reload` : Kayıtlı yazıları yeniden yükler.
+
+--------------------------------------------------------------------------------
+3. ORTAĞIMIN YAPMASI GEREKENLER (TODO)
+--------------------------------------------------------------------------------
+1. Harita Karşılama Yazıları:
+   - Spawn noktalarına sunucu ismi, Discord linki ve VIP avantajlarını gösteren sabit yazılar ekleyin.
+================================================================================
