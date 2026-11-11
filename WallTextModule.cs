@@ -4,14 +4,13 @@ using System.IO;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using MenuApi.API;
 using Microsoft.Extensions.Logging;
-using SwiftlyS2.Core.Menus.OptionsBase;
 using SwiftlyS2.Shared;
 using SwiftlyS2.Shared.Commands;
 using SwiftlyS2.Shared.Events;
 using SwiftlyS2.Shared.GameEventDefinitions;
-using SwiftlyS2.Shared.Menus;
+using SwiftlyS2.Shared.Menu;
+using SwiftlyS2.Shared.Menu.Components;
 using SwiftlyS2.Shared.Misc;
 using SwiftlyS2.Shared.Natives;
 using SwiftlyS2.Shared.Players;
@@ -28,19 +27,118 @@ namespace CS2WallText;
 /// - Interactable Text Buttons (+USE / Shoot triggers with sound, cooldown, and commands).
 /// - Instant Crosshair positioning, wall-relative nudging, and quick orientation tools.
 /// </summary>
-public class WallTextModule
+public partial class WallTextModule
 {
-    private const string MenuTag = "CS2WallText.Menu";
+    private const string MenuTag = "cs2walltext.menu";
     private const float CaptureDebounceSeconds = 0.25f;
     private const float WallOffset = 1.0f;
 
+    private static readonly Regex HtmlTagRegex = new("<[^>]*>", RegexOptions.Compiled);
     private static readonly float[] AvailableSteps = [1f, 5f, 15f, 45f, 90f];
+    private static readonly float[] AvailableScales = [0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.35f, 0.50f, 0.75f, 1.00f, 1.50f, 2.00f];
     private static readonly string[] AvailableFonts = ["", "Arial", "Impact", "Trebuchet MS", "Verdana", "Consolas", "Tahoma"];
+
+    private sealed record ColorPreset(string TranslationKey, string Hex, string SwatchToken);
+
+    private static readonly ColorPreset[] ColorPresets =
+    [
+        new("menu.color.white", "#FFFFFF", "white"),
+        new("menu.color.red", "#FF3333", "red"),
+        new("menu.color.green", "#33FF33", "green"),
+        new("menu.color.blue", "#3388FF", "blue"),
+        new("menu.color.yellow", "#FFFF33", "yellow"),
+        new("menu.color.cyan", "#00FFFF", "cyan"),
+        new("menu.color.orange", "#FFA500", "orange"),
+        new("menu.color.magenta", "#DA70D6", "purple"),
+        new("menu.color.gold", "#FFD700", "yellow"),
+        new("menu.color.pink", "#FF69B4", "pink"),
+        new("menu.color.lime", "#32CD32", "green"),
+        new("menu.color.grey", "#888888", "black")
+    ];
+
+    private sealed class SwatchColorSelector : SelectorComponent<ColorPreset>
+    {
+        public SwatchColorSelector(
+            string text,
+            IReadOnlyList<ColorPreset> choices,
+            int defaultIndex,
+            Action<MenuValueChangedContext<ColorPreset>> onItemChanged,
+            Func<ColorPreset, string> formatter,
+            string? id = null)
+            : base(text, choices, defaultIndex, onItemChanged, id)
+        {
+            Formatter = formatter;
+        }
+
+        public override MenuNode Render(IMenuComponentRenderContext context)
+        {
+            var node = base.Render(context);
+            if (Choices.Count == 0)
+                return node;
+
+            int idx = Math.Clamp(GetValue(context.Session), 0, Choices.Count - 1);
+            string token = Choices[idx].SwatchToken;
+            if (string.IsNullOrEmpty(token))
+                return node;
+
+            var raw = new MenuRawNode("customhud.panorama", $"swatch={token}");
+            return node is MenuLineNode line
+                ? line with { Children = [.. line.Children, raw] }
+                : MenuLineNode.Of(node, raw);
+        }
+    }
+
+    private sealed class DangerSubmenuComponent : SubmenuComponent
+    {
+        public DangerSubmenuComponent(string text, Func<IMenuSession, IMenu?> factory, string? id = null)
+            : base(text, factory, id)
+        {
+            FocusedColor = "#F87171";
+        }
+
+        public override MenuNode Render(IMenuComponentRenderContext context)
+        {
+            var node = base.Render(context);
+            var raw = new MenuRawNode("customhud.panorama", "danger");
+            return node is MenuLineNode line
+                ? line with { Children = [.. line.Children, raw] }
+                : MenuLineNode.Of(node, raw);
+        }
+    }
+
+    private sealed class DangerButtonComponent : ButtonComponent
+    {
+        public DangerButtonComponent(string text, Func<MenuActionContext, ValueTask> onClicked, string? id = null)
+            : base(text, onClicked, id)
+        {
+            FocusedColor = "#F87171";
+        }
+
+        public DangerButtonComponent(string text, Action<MenuActionContext> onClicked, string? id = null)
+            : this(text, ctx => { onClicked(ctx); return ValueTask.CompletedTask; }, id)
+        {
+        }
+
+        public override MenuNode Render(IMenuComponentRenderContext context)
+        {
+            var node = base.Render(context);
+            var raw = new MenuRawNode("customhud.panorama", "danger");
+            return node is MenuLineNode line
+                ? line with { Children = [.. line.Children, raw] }
+                : MenuLineNode.Of(node, raw);
+        }
+    }
+
+    private sealed class PageState
+    {
+        public int? Focus { get; set; }
+        public object? FocusKey { get; set; }
+        public int RowsAt { get; set; }
+        public List<IMenuComponent> Rows { get; } = [];
+    }
 
     private readonly ISwiftlyCore _core;
     private readonly MapContext _mapContext;
-
-    public IMenuApi? MenuApi { get; set; }
 
     private WallTextConfig _config = new();
     private string _configPath = "";
@@ -77,10 +175,10 @@ public class WallTextModule
     // Unified pending chat prompt per player slot (prevents multi-prompt collisions and cleans up on disconnect)
     private readonly Dictionary<int, PendingChatPrompt> _pendingChatBySlot = new();
 
-    // Player menu preferences (keyed by slot for reliable disconnect cleanup)
+    // Player menu preferences and owned menus (keyed by slot for reliable disconnect cleanup)
     private readonly Dictionary<int, float> _playerStepSizes = new();
-    private readonly Dictionary<int, Dictionary<string, int>> _menuCursorBySlot = new(); // remembers highlighted option per menu
-    private readonly Dictionary<int, string> _activeMenuKeyBySlot = new();
+    private readonly Dictionary<int, List<IMenu>> _ownedMenus = new();
+    private readonly Dictionary<int, long> _lastToggleTick = new();
 
     // Rotating announcer runtime state: name -> (index, lastSwitchTime)
     private readonly Dictionary<string, (int Index, float LastSwitchTime)> _rotatingState = new(StringComparer.OrdinalIgnoreCase);
@@ -155,14 +253,14 @@ public class WallTextModule
         _lastPlayerButtons.Clear();
         _playerInteractionCooldowns.Clear();
         _playerStepSizes.Clear();
-        _menuCursorBySlot.Clear();
-        _activeMenuKeyBySlot.Clear();
+        _lastToggleTick.Clear();
     }
 
     private void OnMapChanged()
     {
         // All entities from the previous map are already gone - just forget the handles
         // (never try to Despawn them, their indices may belong to new map entities).
+        CloseAllMenus();
         _liveEntities.Clear();
         _core.Scheduler.NextTick(ReloadForCurrentMap);
 
@@ -725,11 +823,25 @@ public class WallTextModule
 
     private float _lastWatchdogTime;
 
+    private bool HasAnyHumanPlayer()
+    {
+        foreach (var player in _core.PlayerManager.GetAllPlayers())
+        {
+            if (player is { IsValid: true, IsFakeClient: false })
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void UpdateRainbowColors(float now)
     {
         // Guard against GlobalVars.CurrentTime rollback on map transitions
-        if (now >= _lastRainbowUpdateTime && now - _lastRainbowUpdateTime < 0.1f) return;
+        if (now >= _lastRainbowUpdateTime && now - _lastRainbowUpdateTime < 0.25f) return;
         _lastRainbowUpdateTime = now;
+
+        if (!HasAnyHumanPlayer()) return;
 
         foreach (var data in _store.Values)
         {
@@ -968,21 +1080,21 @@ public class WallTextModule
         }
     }
 
-    private void MoveToCrosshair(IPlayer player, string name, bool returnToOrientationMenu = false)
+    private bool MoveToCrosshair(IPlayer player, string name)
     {
         var key = FindKey(name);
         if (key == null || !_store.TryGetValue(key, out var data))
         {
             SendColoredChat(player, $"{Prefix()} {T("chat.not_found", name)}");
-            return;
+            return false;
         }
 
         var pawn = player.PlayerPawn;
-        if (pawn == null || !pawn.IsValid) return;
+        if (pawn == null || !pawn.IsValid) return false;
 
         if (!TryTraceAimPoint(pawn, out var point, out var normal))
         {
-            return;
+            return false;
         }
 
         var placedPos = point + normal * WallOffset;
@@ -994,11 +1106,7 @@ public class WallTextModule
         UpdateLiveEntity(data);
 
         SendColoredChat(player, $"{Prefix()} {T("chat.moved_to_crosshair", data.Name)}");
-        _core.Scheduler.NextTick(() =>
-        {
-            if (returnToOrientationMenu) OpenOrientationMenu(player, data.Name);
-            else OpenDetailMenu(player, data.Name);
-        });
+        return true;
     }
 
     private bool TryTraceAimPoint(CCSPlayerPawn pawn, out Vector point, out Vector normal)
@@ -1160,8 +1268,8 @@ public class WallTextModule
         _lastPlayerButtons.Remove(slot);
         _pendingChatBySlot.Remove(slot);
         _playerStepSizes.Remove(slot);
-        _menuCursorBySlot.Remove(slot);
-        _activeMenuKeyBySlot.Remove(slot);
+        _lastToggleTick.Remove(slot);
+        DisposeSlotMenus(slot);
         _playerInteractionCooldowns.Remove(slot);
     }
 
@@ -1187,7 +1295,7 @@ public class WallTextModule
         var args = ctx.Args;
         if (args.Length == 0 || args[0].Equals("menu", StringComparison.OrdinalIgnoreCase))
         {
-            OpenMainMenu(player);
+            ToggleMainMenu(player);
             return;
         }
 
@@ -1442,6 +1550,12 @@ public class WallTextModule
     {
         var player = _core.PlayerManager.GetPlayer(playerId);
         if (player == null || !player.IsValid)
+        {
+            return HookResult.Continue;
+        }
+
+        // Core.Menu InputComponent odaktayken chat mesajini menuye birak
+        if (_core.Menu.GetSession(player)?.FocusedComponent is InputComponent)
         {
             return HookResult.Continue;
         }
@@ -1789,2007 +1903,4 @@ public class WallTextModule
     }
 
     private string Prefix() => T("chat.prefix");
-
-    // ------------------------------------------------------------------
-    // Menus
-    // ------------------------------------------------------------------
-
-    private void ShowMenu(IPlayer player, IMenuAPI menu, string contextName, [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
-    {
-        // Menus are rebuilt after every click (to refresh labels), which resets the cursor to the top.
-        // Remember the highlighted index per (menu, text) and restore it so the admin stays on the same option.
-        string key = $"{caller}:{contextName}";
-        int slot = player.Slot;
-        if (!_menuCursorBySlot.TryGetValue(slot, out var cursors))
-        {
-            cursors = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            _menuCursorBySlot[slot] = cursors;
-        }
-
-        try
-        {
-            var current = _core.MenusAPI.GetCurrentMenu(player);
-            if (current != null
-                && string.Equals(current.Tag as string, MenuTag, StringComparison.Ordinal)
-                && _activeMenuKeyBySlot.TryGetValue(slot, out var currentKey))
-            {
-                cursors[currentKey] = current.GetCurrentOptionIndex(player);
-            }
-        }
-        catch
-        {
-            // Menu may already be closing
-        }
-
-        menu.Tag = MenuTag;
-        _core.MenusAPI.OpenMenuForPlayer(player, menu);
-        _activeMenuKeyBySlot[slot] = key;
-
-        if (cursors.TryGetValue(key, out var index) && index > 0)
-        {
-            try
-            {
-                menu.MoveToOptionIndex(player, index);
-            }
-            catch
-            {
-                // Option count may have shrunk - keep default cursor
-            }
-        }
-    }
-
-    private void CloseMenu(IPlayer player)
-    {
-        if (MenuApi != null && MenuApi.HasActiveMenu(player))
-        {
-            MenuApi.CloseMenu(player);
-        }
-        var current = _core.MenusAPI.GetCurrentMenu(player);
-        if (current != null)
-        {
-            _core.MenusAPI.CloseMenuForPlayer(player, current);
-        }
-    }
-
-    private void CloseAllMenus()
-    {
-        try
-        {
-            foreach (var player in _core.PlayerManager.GetAllPlayers())
-            {
-                if (player != null && player.IsValid && !player.IsFakeClient)
-                {
-                    if (MenuApi != null && MenuApi.HasActiveMenu(player))
-                    {
-                        MenuApi.CloseMenu(player);
-                    }
-                    var current = _core.MenusAPI.GetCurrentMenu(player);
-                    if (current != null && string.Equals(current.Tag as string, MenuTag, StringComparison.Ordinal))
-                    {
-                        _core.MenusAPI.CloseMenuForPlayer(player, current);
-                    }
-                }
-            }
-        }
-        catch
-        {
-            // Ignore during shutdown
-        }
-    }
-
-    private string GenerateUniqueDefaultName()
-    {
-        int idx = _store.Count + 1;
-        string candidate = $"Text_{idx}";
-        while (FindKey(candidate) != null)
-        {
-            idx++;
-            candidate = $"Text_{idx}";
-        }
-        return candidate;
-    }
-
-    private MenuApi.API.IMenuBuilder CreateMenuApiBuilder(string id, string title, string? subtitle = null)
-    {
-        var b = MenuApi!.CreateBuilder(id, title)
-            .SetTheme(MenuTheme.Blue)
-            .SetItemsPerPage(7)
-            .SetTimeout(TimeSpan.FromSeconds(60))
-            .EnableSounds(true)
-            .EnableSlotSelection(true)
-            .EnableChatSelection(true);
-
-        if (!string.IsNullOrWhiteSpace(subtitle))
-            b.SetSubtitle(subtitle);
-
-        return b;
-    }
-
-    private void OpenMainMenu(IPlayer player)
-    {
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.main.{player.Slot}", $"✦ {T("menu.title.main")} ✦", $"Harita: {_mapContext.CurrentMap} • Kayıtlı: {_store.Count}");
-            b.AddItem($"➕ {T("menu.option.create")}", ctx =>
-            {
-                _core.Scheduler.NextTick(() => BeginCreate(ctx.Player, GenerateUniqueDefaultName()));
-            }, "#4ADE80", closeOnSelect: true);
-
-            b.AddItem("⚡ Hazır Şablon ile Oluştur (5 Şablon)", ctx =>
-            {
-                OpenTemplatesMenu(ctx.Player);
-            }, "#38BDF8", closeOnSelect: false);
-
-            b.AddItem($"📁 {T("menu.option.manage")} ({_store.Count})", ctx =>
-            {
-                OpenListMenu(ctx.Player);
-            }, "#FACC15", closeOnSelect: false);
-
-            b.AddItem("🔄 Harita Yazılarını Yeniden Yükle", ctx =>
-            {
-                LoadConfig();
-                ReloadForCurrentMap();
-                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.reloaded", _mapContext.CurrentMap, _store.Count)}");
-                OpenMainMenu(ctx.Player);
-            }, "#CBD5E1", closeOnSelect: false);
-
-            b.Open(player, 0);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.main"));
-
-        var createBtn = new ButtonMenuOption(T("menu.option.create"), 1000);
-        createBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => BeginCreate(player, GenerateUniqueDefaultName()));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(createBtn);
-
-        var manageBtn = new ButtonMenuOption(T("menu.option.manage"), 1000);
-        manageBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenListMenu(player));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(manageBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, "");
-    }
-
-    private void OpenTemplatesMenu(IPlayer player)
-    {
-        if (MenuApi == null) return;
-
-        var b = CreateMenuApiBuilder($"wt.templates.{player.Slot}", "✦ HAZIR DUVAR YAZISI ŞABLONLARI ✦", "Seçtikten sonra duvara ateş ederek yerleştirin");
-
-        var templates = new (string Label, string Text, string Color, bool Rainbow, float FontSize)[]
-        {
-            ("💬 Discord Topluluk Panosu", "✦ DISCORD TOPLULUĞUMUZ ✦\ndiscord.gg/sunucu", "#38BDF8", false, 36f),
-            ("👑 Hoş Geldiniz & Sunucu Panosu", "★ {SERVER_NAME} ★\nHarita: {MAP} | Oyuncu: {PLAYERS}/{MAXPLAYERS}", "#FFD700", true, 38f),
-            ("⚖️ Sunucu Kuralları Panosu", "⚖ SUNUCU KURALLARI ⚖\n1. Hile ve 3. Parti Yazılım Yasaktır\n2. Küfür ve Hakaret Yasaktır\n3. İyi Oyunlar!", "#FF3333", false, 30f),
-            ("🕒 Canlı Saat & Tarih Panosu", "🕒 SAAT: {TIME}\n📅 TARİH: {DATE}", "#33FF33", false, 34f),
-            ("🎁 Etkileşimli VIP Bilgi Butonu (+USE)", "★ VIP BİLGİ ★\n[E] Tuşuna Basarak İnceleyin!", "#DA70D6", true, 34f)
-        };
-
-        for (int i = 0; i < templates.Length; i++)
-        {
-            var tpl = templates[i];
-            int idx = i;
-            b.AddItem(tpl.Label, ctx =>
-            {
-                var p = ctx.Player;
-                string name = GenerateUniqueDefaultName();
-                CloseMenu(p);
-                SendColoredChat(p, $"{Prefix()} {T("chat.capturing_point", name)}");
-                BeginPointCapture(p, (adm, point, normal) =>
-                {
-                    var placedPos = point + normal * WallOffset;
-                    var angle = CalculateWallAngles(normal, adm.PlayerPawn?.EyeAngles ?? default);
-                    var data = new WallTextData
-                    {
-                        Name = name,
-                        Text = tpl.Text,
-                        Position = [placedPos.X, placedPos.Y, placedPos.Z],
-                        Angles = [angle.Pitch, angle.Yaw, angle.Roll],
-                        Enabled = true,
-                        ColorHex = tpl.Color,
-                        Rainbow = tpl.Rainbow,
-                        FontSize = tpl.FontSize,
-                        Scale = 0.25f,
-                        Fullbright = true,
-                        IsInteractable = idx == 4,
-                        TriggerType = "use",
-                        MessageToPlayer = idx == 4 ? "[gold]★ VIP Ayrıcalıkları için Discord sunucumuza katılın![default]" : ""
-                    };
-                    _store[name] = data;
-                    Save();
-                    SpawnEntity(data);
-                    SendColoredChat(adm, $"{Prefix()} {T("chat.created", name, data.Text.Replace("\n", " "))}");
-                    _core.Scheduler.NextTick(() => OpenDetailMenu(adm, name));
-                });
-            }, "#4ADE80", closeOnSelect: true);
-        }
-
-        b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenMainMenu(ctx.Player), "#FFB000", closeOnSelect: false);
-        b.Open(player, 0);
-    }
-
-    private void OpenListMenu(IPlayer player)
-    {
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.list.{player.Slot}", $"✦ {T("menu.title.list")} ✦", $"Toplam {_store.Count} Duvar Yazısı");
-            if (_store.Count == 0)
-            {
-                b.AddText(T("menu.option.no_items"), "#94A3B8");
-            }
-            else
-            {
-                foreach (var name in new List<string>(_store.Keys))
-                {
-                    var capturedName = name;
-                    var data = _store[name];
-                    string preview = data.Text.Replace("\n", " ");
-                    if (preview.Length > 20) preview = preview[..17] + "...";
-                    var label = $"{data.Name}: \"{preview}\" [{(data.Enabled ? "ON" : "OFF")}]";
-                    b.AddItem(label, ctx => OpenDetailMenu(ctx.Player, capturedName), data.Enabled ? "#4ADE80" : "#F87171", closeOnSelect: false);
-                }
-            }
-            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenMainMenu(ctx.Player), "#FFB000", closeOnSelect: false);
-            b.Open(player, 0);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.list"));
-
-        if (_store.Count == 0)
-        {
-            builder.AddOption(new TextMenuOption(T("menu.option.no_items"), 1000));
-        }
-        else
-        {
-            foreach (var name in new List<string>(_store.Keys))
-            {
-                var capturedName = name;
-                var data = _store[name];
-                string preview = data.Text.Replace("\n", " ");
-                if (preview.Length > 20) preview = preview[..17] + "...";
-                var label = $"{data.Name}: \"{preview}\" [{(data.Enabled ? "ON" : "OFF")}]";
-                var btn = new ButtonMenuOption(label, 1000);
-                btn.Click += (sender, args) =>
-                {
-                    _core.Scheduler.NextTick(() => OpenDetailMenu(player, capturedName));
-                    return ValueTask.CompletedTask;
-                };
-                builder.AddOption(btn);
-            }
-        }
-
-        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
-        backBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenMainMenu(player));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(backBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, "");
-    }
-
-    private void OpenDetailMenu(IPlayer player, string name, int pageIdx = 0)
-    {
-        var key = FindKey(name);
-        if (key == null || !_store.TryGetValue(key, out var data))
-        {
-            OpenListMenu(player);
-            return;
-        }
-
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.detail.{player.Slot}", $"✦ {data.Name} ✦", $"[P:{data.Angles[0]:0}° Y:{data.Angles[1]:0}° R:{data.Angles[2]:0}°] • Boyut: {data.FontSize:0}");
-
-            b.AddItem($"{T("menu.option.enabled")}: [{(data.Enabled ? "AKTİF" : "KAPALI")}]", ctx =>
-            {
-                data.Enabled = !data.Enabled;
-                Save();
-                if (data.Enabled) SpawnEntity(data);
-                else DespawnEntity(data.Name);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, data.Enabled ? "#4ADE80" : "#F87171", closeOnSelect: false);
-
-            b.AddItem($"🎯 {T("menu.option.move_to_crosshair")}", ctx =>
-            {
-                MoveToCrosshair(ctx.Player, data.Name);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#38BDF8", closeOnSelect: false);
-
-            b.AddItem($"🧭 {T("menu.option.orientation_menu")}", ctx =>
-            {
-                OpenOrientationMenu(ctx.Player, data.Name);
-            }, "#FACC15", closeOnSelect: false);
-
-            b.AddItem($"📐 {T("menu.option.fine_tune")}", ctx =>
-            {
-                OpenFineTuneMenu(ctx.Player, data.Name);
-            }, "#FACC15", closeOnSelect: false);
-
-            b.AddItem($"✏️ {T("menu.option.change_text")}", ctx =>
-            {
-                SetPendingChat(ctx.Player, ChatPromptKind.ChangeText, data.Name);
-                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_text")}");
-            }, "#38BDF8", closeOnSelect: true);
-
-            b.AddItem($"🎨 {T("menu.option.color_menu", data.ColorHex)}", ctx =>
-            {
-                OpenColorMenu(ctx.Player, data.Name);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem($"🌈 {T("menu.option.rainbow", data.Rainbow ? "ON" : "OFF")}", ctx =>
-            {
-                data.Rainbow = !data.Rainbow;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, data.Rainbow ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
-
-            if (data.Rainbow)
-            {
-                b.AddItem($"⚡ {T("menu.option.rainbow_speed", data.RainbowSpeed)}", ctx =>
-                {
-                    data.RainbowSpeed = data.RainbowSpeed switch
-                    {
-                        <= 0.5f => 1.0f,
-                        <= 1.0f => 2.0f,
-                        <= 2.0f => 0.5f,
-                        _ => 1.0f
-                    };
-                    Save();
-                    OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-                }, "#FACC15", closeOnSelect: false);
-            }
-
-            b.AddItem($"🔄 {T("menu.option.rotating_menu", data.RotatingMessages.Count)}", ctx =>
-            {
-                OpenRotatingMenu(ctx.Player, data.Name);
-            }, "#38BDF8", closeOnSelect: false);
-
-            b.AddItem($"🔘 {T("menu.option.interact_menu")}", ctx =>
-            {
-                OpenInteractMenu(ctx.Player, data.Name);
-            }, "#38BDF8", closeOnSelect: false);
-
-            string fLabel = string.IsNullOrWhiteSpace(data.FontName) ? "Default" : data.FontName;
-            b.AddItem($"🔤 {T("menu.option.font", fLabel)}", ctx =>
-            {
-                int curIdx = Array.IndexOf(AvailableFonts, data.FontName ?? "");
-                int nextIdx = (curIdx + 1) % AvailableFonts.Length;
-                data.FontName = AvailableFonts[nextIdx];
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem($"📏 {T("menu.option.font_size")}: [{data.FontSize:0}] (+4)", ctx =>
-            {
-                data.FontSize = data.FontSize >= 72f ? 12f : data.FontSize + 4f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem($"🔍 {T("menu.option.scale")}: [{data.Scale:0.00}]", ctx =>
-            {
-                float[] scales = [0.10f, 0.15f, 0.20f, 0.25f, 0.35f, 0.50f, 0.75f, 1.00f];
-                int idx = Array.FindIndex(scales, s => MathF.Abs(s - data.Scale) < 0.02f);
-                data.Scale = scales[(idx + 1) % scales.Length];
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem($"👁️ {T("menu.option.face_player")}: [{(data.FacePlayer ? "AKTİF" : "KAPALI")}]", ctx =>
-            {
-                data.FacePlayer = !data.FacePlayer;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, data.FacePlayer ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
-
-            b.AddItem($"💡 {T("menu.option.fullbright")}: [{(data.Fullbright ? "AKTİF" : "KAPALI")}]", ctx =>
-            {
-                data.Fullbright = !data.Fullbright;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, data.Fullbright ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
-
-            b.AddItem($"🖼️ {T("menu.option.background")}: [{(data.Background ? "AKTİF" : "KAPALI")}]", ctx =>
-            {
-                data.Background = !data.Background;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, data.Background ? "#4ADE80" : "#CBD5E1", closeOnSelect: false);
-
-            b.AddItem($"⚡ {T("menu.option.teleport")}", ctx =>
-            {
-                TeleportToText(ctx.Player, data.Name);
-                OpenDetailMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#38BDF8", closeOnSelect: false);
-
-            b.AddItem($"🎯 {T("menu.option.reaim")}", ctx =>
-            {
-                BeginReaim(ctx.Player, data.Name);
-            }, "#38BDF8", closeOnSelect: true);
-
-            b.AddItem($"📋 {T("menu.option.duplicate")}", ctx =>
-            {
-                BeginDuplicate(ctx.Player, data.Name);
-            }, "#4ADE80", closeOnSelect: true);
-
-            b.AddItem($"✏️ {T("menu.option.rename")}", ctx =>
-            {
-                BeginRename(ctx.Player, data.Name);
-            }, "#FACC15", closeOnSelect: true);
-
-            b.AddItem($"🗑️ {T("menu.option.delete")}", ctx =>
-            {
-                DespawnEntity(data.Name);
-                _store.Remove(data.Name);
-                Save();
-                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.deleted", data.Name)}");
-                OpenListMenu(ctx.Player);
-            }, "#F87171", closeOnSelect: false);
-
-            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenListMenu(ctx.Player), "#FFB000", closeOnSelect: false);
-            b.Open(player, pageIdx);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.detail", $"{data.Name} [P:{data.Angles[0]:0}° Y:{data.Angles[1]:0}° R:{data.Angles[2]:0}°]"));
-
-        // 1. Enabled Toggle
-        var enabledToggle = new ToggleMenuOption(T("menu.option.enabled"), data.Enabled);
-        enabledToggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Enabled = e.NewValue;
-                Save();
-                if (data.Enabled)
-                {
-                    SpawnEntity(data);
-                }
-                else
-                {
-                    DespawnEntity(data.Name);
-                }
-            });
-        };
-        builder.AddOption(enabledToggle);
-
-        // 2. Move To Crosshair (Instant)
-        var crosshairBtn = new ButtonMenuOption(T("menu.option.move_to_crosshair"), 1000);
-        crosshairBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => MoveToCrosshair(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(crosshairBtn);
-
-        // 3. Orientation & Quick Align Sub-Menu
-        var orientMenuBtn = new ButtonMenuOption(T("menu.option.orientation_menu"), 1000);
-        orientMenuBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenOrientationMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(orientMenuBtn);
-
-        // 4. Fine-Tune Position & Angles Sub-Menu
-        var fineTuneBtn = new ButtonMenuOption(T("menu.option.fine_tune"), 1000);
-        fineTuneBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenFineTuneMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(fineTuneBtn);
-
-        // 5. Change Text
-        var changeTextBtn = new ButtonMenuOption(T("menu.option.change_text"), 1000);
-        changeTextBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                SetPendingChat(player, ChatPromptKind.ChangeText, data.Name);
-                SendColoredChat(player, $"{Prefix()} {T("chat.enter_text")}");
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(changeTextBtn);
-
-        // 6. Color Sub-Menu
-        var colorBtn = new ButtonMenuOption(T("menu.option.color_menu", data.ColorHex), 1000);
-        colorBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenColorMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(colorBtn);
-
-        // 7. Rainbow (RGB) Toggle & Speed
-        var rainbowToggle = new ToggleMenuOption(T("menu.option.rainbow", data.Rainbow ? "ON" : "OFF"), data.Rainbow);
-        rainbowToggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Rainbow = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-        };
-        builder.AddOption(rainbowToggle);
-
-        if (data.Rainbow)
-        {
-            var speedBtn = new ButtonMenuOption(T("menu.option.rainbow_speed", data.RainbowSpeed), 1000);
-            speedBtn.Click += (sender, args) =>
-            {
-                _core.Scheduler.NextTick(() =>
-                {
-                    data.RainbowSpeed = data.RainbowSpeed switch
-                    {
-                        <= 0.5f => 1.0f,
-                        <= 1.0f => 2.0f,
-                        <= 2.0f => 0.5f,
-                        _ => 1.0f
-                    };
-                    Save();
-                    OpenDetailMenu(player, data.Name);
-                });
-                return ValueTask.CompletedTask;
-            };
-            builder.AddOption(speedBtn);
-        }
-
-        // 8. Rotating Announcer Board Sub-Menu
-        var rotMenuBtn = new ButtonMenuOption(T("menu.option.rotating_menu", data.RotatingMessages.Count), 1000);
-        rotMenuBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenRotatingMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(rotMenuBtn);
-
-        // 9. Interactive Trigger Sub-Menu
-        var interactMenuBtn = new ButtonMenuOption(T("menu.option.interact_menu"), 1000);
-        interactMenuBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenInteractMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(interactMenuBtn);
-
-        // 10. Sliders & Styling: Font, Font Size, Scale, Background, Fullbright, FacePlayer, Alignment
-        string fontLabel = string.IsNullOrWhiteSpace(data.FontName) ? "Default" : data.FontName;
-        var fontBtn = new ButtonMenuOption(T("menu.option.font", fontLabel), 1000);
-        fontBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                int curIdx = Array.IndexOf(AvailableFonts, data.FontName ?? "");
-                int nextIdx = (curIdx + 1) % AvailableFonts.Length;
-                data.FontName = AvailableFonts[nextIdx];
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(fontBtn);
-
-        var fontSizeSlider = new SliderMenuOption(T("menu.option.font_size"), 8f, 72f, data.FontSize, 1f, 10, 120, 1000);
-        fontSizeSlider.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.FontSize = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-            });
-        };
-        builder.AddOption(fontSizeSlider);
-
-        var scaleSlider = new SliderMenuOption(T("menu.option.scale"), 0.05f, 2f, data.Scale, 0.05f, 10, 120, 1000);
-        scaleSlider.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Scale = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-            });
-        };
-        builder.AddOption(scaleSlider);
-
-        string justifyLabel = data.JustifyHorizontal switch
-        {
-            0 => T("menu.option.justify_left"),
-            2 => T("menu.option.justify_right"),
-            _ => T("menu.option.justify_center")
-        };
-        var justifyBtn = new ButtonMenuOption(T("menu.option.justify", justifyLabel), 1000);
-        justifyBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.JustifyHorizontal = (data.JustifyHorizontal + 1) % 3;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(justifyBtn);
-
-        string justifyVertLabel = data.JustifyVertical switch
-        {
-            0 => T("menu.option.justify_bottom"),
-            2 => T("menu.option.justify_top"),
-            _ => T("menu.option.justify_center")
-        };
-        var justifyVertBtn = new ButtonMenuOption(T("menu.option.justify_vert", justifyVertLabel), 1000);
-        justifyVertBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.JustifyVertical = (data.JustifyVertical + 1) % 3;
-                Save();
-                UpdateLiveEntity(data);
-                OpenDetailMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(justifyVertBtn);
-
-        var facePlayerToggle = new ToggleMenuOption(T("menu.option.face_player"), data.FacePlayer);
-        facePlayerToggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.FacePlayer = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-            });
-        };
-        builder.AddOption(facePlayerToggle);
-
-        var fullbrightToggle = new ToggleMenuOption(T("menu.option.fullbright"), data.Fullbright);
-        fullbrightToggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Fullbright = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-            });
-        };
-        builder.AddOption(fullbrightToggle);
-
-        var backgroundToggle = new ToggleMenuOption(T("menu.option.background"), data.Background);
-        backgroundToggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Background = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-            });
-        };
-        builder.AddOption(backgroundToggle);
-
-        // 11. Teleport, Re-aim, Duplicate, Rename, Delete
-        var tpBtn = new ButtonMenuOption(T("menu.option.teleport"), 1000);
-        tpBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => TeleportToText(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(tpBtn);
-
-        var reaimBtn = new ButtonMenuOption(T("menu.option.reaim"), 1000);
-        reaimBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => BeginReaim(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(reaimBtn);
-
-        var dupBtn = new ButtonMenuOption(T("menu.option.duplicate"), 1000);
-        dupBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => BeginDuplicate(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(dupBtn);
-
-        var renameBtn = new ButtonMenuOption(T("menu.option.rename"), 1000);
-        renameBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => BeginRename(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(renameBtn);
-
-        var deleteBtn = new ButtonMenuOption(T("menu.option.delete"), 1000);
-        deleteBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                DespawnEntity(data.Name);
-                _store.Remove(data.Name);
-                Save();
-                SendColoredChat(player, $"{Prefix()} {T("chat.deleted", data.Name)}");
-                OpenListMenu(player);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(deleteBtn);
-
-        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
-        backBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenListMenu(player));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(backBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, name);
-    }
-
-    // ------------------------------------------------------------------
-    // Sub-Menu: Orientation & Quick Alignment Tools
-    // ------------------------------------------------------------------
-
-    private void OpenOrientationMenu(IPlayer player, string name, int pageIdx = 0)
-    {
-        var key = FindKey(name);
-        if (key == null || !_store.TryGetValue(key, out var data))
-        {
-            OpenListMenu(player);
-            return;
-        }
-
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.orient.{player.Slot}", $"✦ YÖN & HİZALAMA: {data.Name} ✦", $"[P:{data.Angles[0]:0}° Y:{data.Angles[1]:0}° R:{data.Angles[2]:0}°]");
-
-            b.AddItem(T("menu.option.move_to_crosshair"), ctx =>
-            {
-                MoveToCrosshair(ctx.Player, data.Name, returnToOrientationMenu: true);
-            }, "#38BDF8", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.face_admin"), ctx =>
-            {
-                if (ctx.Player.PlayerPawn != null && ctx.Player.PlayerPawn.AbsOrigin.HasValue)
-                {
-                    var pPos = ctx.Player.PlayerPawn.AbsOrigin.Value;
-                    float dx = pPos.X - data.Position[0];
-                    float dy = pPos.Y - data.Position[1];
-                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, 0f, keepUpright: true);
-                    data.Angles[0] = fp; data.Angles[1] = fy; data.Angles[2] = fr;
-                    Save(); UpdateLiveEntity(data);
-                }
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#4ADE80", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.face_admin_3d"), ctx =>
-            {
-                if (ctx.Player.PlayerPawn != null && TryGetEyePosition(ctx.Player.PlayerPawn, out var eyePos))
-                {
-                    float dx = eyePos.X - data.Position[0];
-                    float dy = eyePos.Y - data.Position[1];
-                    float dz = eyePos.Z - data.Position[2];
-                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, dz, keepUpright: false);
-                    data.Angles[0] = fp; data.Angles[1] = fy; data.Angles[2] = fr;
-                    Save(); UpdateLiveEntity(data);
-                }
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#4ADE80", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.flip_180"), ctx =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] + 180f);
-                Save(); UpdateLiveEntity(data);
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.rotate_90"), ctx =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] + 90f);
-                Save(); UpdateLiveEntity(data);
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.pitch_up"), ctx =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] + 90f);
-                Save(); UpdateLiveEntity(data);
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.pitch_down"), ctx =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] - 90f);
-                Save(); UpdateLiveEntity(data);
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.roll_rotate"), ctx =>
-            {
-                data.Angles[2] = NormalizeAngle(data.Angles[2] + 90f);
-                Save(); UpdateLiveEntity(data);
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.preset_wall_roll90"), ctx =>
-            {
-                data.Angles[0] = 0f; data.Angles[2] = 90f;
-                Save(); UpdateLiveEntity(data);
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#FACC15", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.preset_flat"), ctx =>
-            {
-                data.Angles[0] = 0f; data.Angles[2] = 0f;
-                Save(); UpdateLiveEntity(data);
-                OpenOrientationMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#FACC15", closeOnSelect: false);
-
-            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
-            b.Open(player, pageIdx);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.orientation", $"{data.Name} [P:{data.Angles[0]:0}° Y:{data.Angles[1]:0}° R:{data.Angles[2]:0}°]"));
-
-        // Move to crosshair
-        var crosshairBtn = new ButtonMenuOption(T("menu.option.move_to_crosshair"), 1000);
-        crosshairBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => MoveToCrosshair(player, data.Name, returnToOrientationMenu: true));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(crosshairBtn);
-
-        // Face towards admin (Horizontal Yaw only)
-        var faceAdminBtn = new ButtonMenuOption(T("menu.option.face_admin"), 1000);
-        faceAdminBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                if (player.PlayerPawn != null && player.PlayerPawn.AbsOrigin.HasValue)
-                {
-                    var pPos = player.PlayerPawn.AbsOrigin.Value;
-                    float dx = pPos.X - data.Position[0];
-                    float dy = pPos.Y - data.Position[1];
-                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, 0f, keepUpright: true);
-                    data.Angles[0] = fp;
-                    data.Angles[1] = fy;
-                    data.Angles[2] = fr;
-                    Save();
-                    UpdateLiveEntity(data);
-                }
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(faceAdminBtn);
-
-        // Face towards admin's eyes (Full 3D Pitch + Yaw)
-        var faceAdmin3dBtn = new ButtonMenuOption(T("menu.option.face_admin_3d"), 1000);
-        faceAdmin3dBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                if (player.PlayerPawn != null && TryGetEyePosition(player.PlayerPawn, out var eyePos))
-                {
-                    float dx = eyePos.X - data.Position[0];
-                    float dy = eyePos.Y - data.Position[1];
-                    float dz = eyePos.Z - data.Position[2];
-                    var (fp, fy, fr) = AnglesFacingDirection(dx, dy, dz, keepUpright: false);
-                    data.Angles[0] = fp;
-                    data.Angles[1] = fy;
-                    data.Angles[2] = fr;
-                    Save();
-                    UpdateLiveEntity(data);
-                }
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(faceAdmin3dBtn);
-
-        // Flip 180 deg
-        var flip180Btn = new ButtonMenuOption(T("menu.option.flip_180"), 1000);
-        flip180Btn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] + 180f);
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(flip180Btn);
-
-        // Rotate Yaw +90 deg
-        var rot90Btn = new ButtonMenuOption(T("menu.option.rotate_90"), 1000);
-        rot90Btn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] + 90f);
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(rot90Btn);
-
-        // Pitch +90 deg
-        var pitchUpBtn = new ButtonMenuOption(T("menu.option.pitch_up"), 1000);
-        pitchUpBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] + 90f);
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(pitchUpBtn);
-
-        // Pitch -90 deg
-        var pitchDownBtn = new ButtonMenuOption(T("menu.option.pitch_down"), 1000);
-        pitchDownBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] - 90f);
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(pitchDownBtn);
-
-        // Roll +90 deg
-        var rollBtn = new ButtonMenuOption(T("menu.option.roll_rotate"), 1000);
-        rollBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[2] = NormalizeAngle(data.Angles[2] + 90f);
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(rollBtn);
-
-        // Presets
-        var presetVertBtn = new ButtonMenuOption(T("menu.option.preset_vertical"), 1000);
-        presetVertBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = 90f;
-                data.Angles[2] = 0f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(presetVertBtn);
-
-        var presetVertNegBtn = new ButtonMenuOption(T("menu.option.preset_vertical_neg"), 1000);
-        presetVertNegBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = -90f;
-                data.Angles[2] = 0f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(presetVertNegBtn);
-
-        var presetWallRoll90Btn = new ButtonMenuOption(T("menu.option.preset_wall_roll90"), 1000);
-        presetWallRoll90Btn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = 0f;
-                data.Angles[2] = 90f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(presetWallRoll90Btn);
-
-        var presetFlatBtn = new ButtonMenuOption(T("menu.option.preset_flat"), 1000);
-        presetFlatBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = 0f;
-                data.Angles[2] = 0f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenOrientationMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(presetFlatBtn);
-
-        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
-        backBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(backBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, name);
-    }
-
-    // ------------------------------------------------------------------
-    // Sub-Menu: Rotating Announcer Board
-    // ------------------------------------------------------------------
-
-    private void OpenRotatingMenu(IPlayer player, string name, int pageIdx = 0)
-    {
-        var key = FindKey(name);
-        if (key == null || !_store.TryGetValue(key, out var data))
-        {
-            OpenListMenu(player);
-            return;
-        }
-
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.rot.{player.Slot}", $"✦ DÖNÜŞÜMLÜ DUYURU: {data.Name} ✦", $"Kayıtlı Mesaj: {data.RotatingMessages.Count}");
-            b.AddItem($"{T("menu.option.rotating_toggle")}: [{(data.IsRotating ? "AKTİF" : "KAPALI")}]", ctx =>
-            {
-                data.IsRotating = !data.IsRotating;
-                Save(); UpdateLiveEntity(data);
-                OpenRotatingMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, data.IsRotating ? "#4ADE80" : "#F87171", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.rotating_interval", (int)data.RotationIntervalSeconds), ctx =>
-            {
-                data.RotationIntervalSeconds = data.RotationIntervalSeconds switch
-                {
-                    <= 5f => 10f, <= 10f => 20f, <= 20f => 30f, <= 30f => 60f, _ => 5f
-                };
-                Save();
-                OpenRotatingMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#FACC15", closeOnSelect: false);
-
-            b.AddItem($"➕ {T("menu.option.add_rotating_msg")}", ctx =>
-            {
-                SetPendingChat(ctx.Player, ChatPromptKind.AddRotatingMessage, data.Name);
-                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_rotating_message")}");
-            }, "#38BDF8", closeOnSelect: true);
-
-            if (data.RotatingMessages.Count > 0)
-            {
-                b.AddItem($"🗑️ {T("menu.option.clear_rotating_msgs")}", ctx =>
-                {
-                    data.RotatingMessages.Clear();
-                    data.IsRotating = false;
-                    Save(); UpdateLiveEntity(data);
-                    SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.rotating_messages_cleared", data.Name)}");
-                    OpenRotatingMenu(ctx.Player, data.Name, 0);
-                }, "#F87171", closeOnSelect: false);
-
-                for (int i = 0; i < data.RotatingMessages.Count; i++)
-                {
-                    int index = i;
-                    string preview = data.RotatingMessages[index].Replace("\n", " ");
-                    if (preview.Length > 28) preview = preview[..25] + "...";
-                    b.AddItem($"#{index + 1}: {preview} [Sil]", ctx =>
-                    {
-                        if (index >= 0 && index < data.RotatingMessages.Count)
-                            data.RotatingMessages.RemoveAt(index);
-                        if (data.RotatingMessages.Count == 0) data.IsRotating = false;
-                        Save(); UpdateLiveEntity(data);
-                        OpenRotatingMenu(ctx.Player, data.Name, ctx.PageIndex);
-                    }, "#E2E8F0", closeOnSelect: false);
-                }
-            }
-
-            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
-            b.Open(player, pageIdx);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.rotating", data.Name));
-
-        // Toggle rotation
-        var toggle = new ToggleMenuOption(T("menu.option.rotating_toggle"), data.IsRotating);
-        toggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.IsRotating = e.NewValue;
-                Save();
-                UpdateLiveEntity(data);
-                OpenRotatingMenu(player, data.Name);
-            });
-        };
-        builder.AddOption(toggle);
-
-        // Interval button: 5s -> 10s -> 20s -> 30s -> 60s
-        var intervalBtn = new ButtonMenuOption(T("menu.option.rotating_interval", (int)data.RotationIntervalSeconds), 1000);
-        intervalBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.RotationIntervalSeconds = data.RotationIntervalSeconds switch
-                {
-                    <= 5f => 10f,
-                    <= 10f => 20f,
-                    <= 20f => 30f,
-                    <= 30f => 60f,
-                    _ => 5f
-                };
-                Save();
-                OpenRotatingMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(intervalBtn);
-
-        // Add new message button
-        var addBtn = new ButtonMenuOption(T("menu.option.add_rotating_msg"), 1000);
-        addBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                SetPendingChat(player, ChatPromptKind.AddRotatingMessage, data.Name);
-                SendColoredChat(player, $"{Prefix()} {T("chat.enter_rotating_message")}");
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(addBtn);
-
-        // Clear all messages
-        if (data.RotatingMessages.Count > 0)
-        {
-            var clearBtn = new ButtonMenuOption(T("menu.option.clear_rotating_msgs"), 1000);
-            clearBtn.Click += (sender, args) =>
-            {
-                _core.Scheduler.NextTick(() =>
-                {
-                    data.RotatingMessages.Clear();
-                    data.IsRotating = false;
-                    Save();
-                    UpdateLiveEntity(data);
-                    SendColoredChat(player, $"{Prefix()} {T("chat.rotating_messages_cleared", data.Name)}");
-                    OpenRotatingMenu(player, data.Name);
-                });
-                return ValueTask.CompletedTask;
-            };
-            builder.AddOption(clearBtn);
-
-            // List of messages
-            for (int i = 0; i < data.RotatingMessages.Count; i++)
-            {
-                int index = i;
-                string preview = data.RotatingMessages[index].Replace("\n", " ");
-                if (preview.Length > 28) preview = preview[..25] + "...";
-                var itemBtn = new ButtonMenuOption($"#{index + 1}: {preview} [X]", 1000);
-                itemBtn.Click += (sender, args) =>
-                {
-                    _core.Scheduler.NextTick(() =>
-                    {
-                        if (index >= 0 && index < data.RotatingMessages.Count)
-                        {
-                            data.RotatingMessages.RemoveAt(index);
-                        }
-                        if (data.RotatingMessages.Count == 0) data.IsRotating = false;
-                        Save();
-                        UpdateLiveEntity(data);
-                        OpenRotatingMenu(player, data.Name);
-                    });
-                    return ValueTask.CompletedTask;
-                };
-                builder.AddOption(itemBtn);
-            }
-        }
-
-        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
-        backBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(backBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, name);
-    }
-
-    // ------------------------------------------------------------------
-    // Sub-Menu: Interactive Trigger
-    // ------------------------------------------------------------------
-
-    private void OpenInteractMenu(IPlayer player, string name, int pageIdx = 0)
-    {
-        var key = FindKey(name);
-        if (key == null || !_store.TryGetValue(key, out var data))
-        {
-            OpenListMenu(player);
-            return;
-        }
-
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.interact.{player.Slot}", $"✦ ETKİLEŞİMLİ BUTON: {data.Name} ✦", "+USE (E) veya Ateş Tetikleyici");
-
-            b.AddItem($"{T("menu.option.interact_toggle")}: [{(data.IsInteractable ? "AKTİF" : "KAPALI")}]", ctx =>
-            {
-                data.IsInteractable = !data.IsInteractable;
-                Save();
-                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, data.IsInteractable ? "#4ADE80" : "#F87171", closeOnSelect: false);
-
-            string tLabel = data.TriggerType.ToLowerInvariant() switch
-            {
-                "use" => T("trigger.type.use"),
-                "shoot" => T("trigger.type.shoot"),
-                _ => T("trigger.type.both")
-            };
-            b.AddItem(T("menu.option.interact_trigger_type", tLabel), ctx =>
-            {
-                data.TriggerType = data.TriggerType.ToLowerInvariant() switch
-                {
-                    "both" => "use", "use" => "shoot", _ => "both"
-                };
-                Save();
-                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#FACC15", closeOnSelect: false);
-
-            string cMsg = string.IsNullOrWhiteSpace(data.MessageToPlayer) ? "Yok" : data.MessageToPlayer.Replace("\n", " ");
-            if (cMsg.Length > 20) cMsg = cMsg[..17] + "...";
-            b.AddItem($"{T("menu.option.set_interact_msg")} [{cMsg}]", ctx =>
-            {
-                SetPendingChat(ctx.Player, ChatPromptKind.InteractMessage, data.Name);
-                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_interact_msg")}");
-            }, "#38BDF8", closeOnSelect: true);
-
-            string cCmd = string.IsNullOrWhiteSpace(data.CommandToRun) ? "Yok" : data.CommandToRun;
-            if (cCmd.Length > 20) cCmd = cCmd[..17] + "...";
-            b.AddItem($"{T("menu.option.set_interact_cmd")} [{cCmd}]", ctx =>
-            {
-                SetPendingChat(ctx.Player, ChatPromptKind.InteractCommand, data.Name);
-                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_interact_cmd")}");
-            }, "#38BDF8", closeOnSelect: true);
-
-            b.AddItem(T("menu.option.interact_dist", (int)data.InteractionDistance), ctx =>
-            {
-                data.InteractionDistance = data.InteractionDistance switch
-                {
-                    <= 150f => 250f, <= 250f => 400f, <= 400f => 600f, _ => 150f
-                };
-                Save();
-                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.interact_cooldown", data.CooldownSeconds), ctx =>
-            {
-                data.CooldownSeconds = data.CooldownSeconds switch
-                {
-                    <= 0.5f => 1.0f, <= 1.0f => 2.0f, <= 2.0f => 5.0f, <= 5.0f => 10.0f, _ => 0.5f
-                };
-                Save();
-                OpenInteractMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
-            b.Open(player, pageIdx);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.interact", data.Name));
-
-        // Toggle interactable
-        var toggle = new ToggleMenuOption(T("menu.option.interact_toggle"), data.IsInteractable);
-        toggle.ValueChanged += (sender, e) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.IsInteractable = e.NewValue;
-                Save();
-                OpenInteractMenu(player, data.Name);
-            });
-        };
-        builder.AddOption(toggle);
-
-        // Trigger type button (Both -> Use -> Shoot)
-        string trigLabel = data.TriggerType.ToLowerInvariant() switch
-        {
-            "use" => T("trigger.type.use"),
-            "shoot" => T("trigger.type.shoot"),
-            _ => T("trigger.type.both")
-        };
-        var typeBtn = new ButtonMenuOption(T("menu.option.interact_trigger_type", trigLabel), 1000);
-        typeBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.TriggerType = data.TriggerType.ToLowerInvariant() switch
-                {
-                    "both" => "use",
-                    "use" => "shoot",
-                    _ => "both"
-                };
-                Save();
-                OpenInteractMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(typeBtn);
-
-        // Set message to player
-        string curMsg = string.IsNullOrWhiteSpace(data.MessageToPlayer) ? "Yok" : data.MessageToPlayer.Replace("\n", " ");
-        if (curMsg.Length > 20) curMsg = curMsg[..17] + "...";
-        var setMsgBtn = new ButtonMenuOption($"{T("menu.option.set_interact_msg")} [{curMsg}]", 1000);
-        setMsgBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                SetPendingChat(player, ChatPromptKind.InteractMessage, data.Name);
-                SendColoredChat(player, $"{Prefix()} {T("chat.enter_interact_msg")}");
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(setMsgBtn);
-
-        // Set command to run
-        string curCmd = string.IsNullOrWhiteSpace(data.CommandToRun) ? "Yok" : data.CommandToRun;
-        if (curCmd.Length > 20) curCmd = curCmd[..17] + "...";
-        var setCmdBtn = new ButtonMenuOption($"{T("menu.option.set_interact_cmd")} [{curCmd}]", 1000);
-        setCmdBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                SetPendingChat(player, ChatPromptKind.InteractCommand, data.Name);
-                SendColoredChat(player, $"{Prefix()} {T("chat.enter_interact_cmd")}");
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(setCmdBtn);
-
-        // Max interaction distance: 150 -> 250 -> 400 -> 600
-        var distBtn = new ButtonMenuOption(T("menu.option.interact_dist", (int)data.InteractionDistance), 1000);
-        distBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.InteractionDistance = data.InteractionDistance switch
-                {
-                    <= 150f => 250f,
-                    <= 250f => 400f,
-                    <= 400f => 600f,
-                    _ => 150f
-                };
-                Save();
-                OpenInteractMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(distBtn);
-
-        // Cooldown: 0.5s -> 1s -> 2s -> 5s -> 10s
-        var cooldownBtn = new ButtonMenuOption(T("menu.option.interact_cooldown", data.CooldownSeconds), 1000);
-        cooldownBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.CooldownSeconds = data.CooldownSeconds switch
-                {
-                    <= 0.5f => 1.0f,
-                    <= 1.0f => 2.0f,
-                    <= 2.0f => 5.0f,
-                    <= 5.0f => 10.0f,
-                    _ => 0.5f
-                };
-                Save();
-                OpenInteractMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(cooldownBtn);
-
-        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
-        backBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(backBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, name);
-    }
-
-    // ------------------------------------------------------------------
-    // Sub-Menu: Color Selection
-    // ------------------------------------------------------------------
-
-    private void OpenColorMenu(IPlayer player, string name, int pageIdx = 0)
-    {
-        var key = FindKey(name);
-        if (key == null || !_store.TryGetValue(key, out var data))
-        {
-            OpenListMenu(player);
-            return;
-        }
-
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.color.{player.Slot}", $"✦ RENK SEÇİMİ: {data.Name} ✦", $"Mevcut: {data.ColorHex}");
-            var colorPresets = new (string Key, string Hex)[]
-            {
-                ("menu.color.white", "#FFFFFF"),
-                ("menu.color.red", "#FF3333"),
-                ("menu.color.green", "#33FF33"),
-                ("menu.color.blue", "#3388FF"),
-                ("menu.color.yellow", "#FFFF33"),
-                ("menu.color.cyan", "#00FFFF"),
-                ("menu.color.orange", "#FFA500"),
-                ("menu.color.magenta", "#DA70D6"),
-                ("menu.color.gold", "#FFD700"),
-                ("menu.color.pink", "#FF69B4"),
-                ("menu.color.lime", "#32CD32"),
-                ("menu.color.grey", "#888888"),
-            };
-
-            foreach (var (presetKey, hex) in colorPresets)
-            {
-                var capturedHex = hex;
-                b.AddItem($"{T(presetKey)} ({capturedHex})", ctx =>
-                {
-                    data.ColorHex = capturedHex;
-                    data.Rainbow = false;
-                    Save(); UpdateLiveEntity(data);
-                    SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.color_changed", capturedHex)}");
-                    OpenColorMenu(ctx.Player, data.Name, ctx.PageIndex);
-                }, capturedHex, closeOnSelect: false);
-            }
-
-            b.AddItem($"✏️ {T("menu.color.custom")}", ctx =>
-            {
-                SetPendingChat(ctx.Player, ChatPromptKind.ColorHex, data.Name);
-                SendColoredChat(ctx.Player, $"{Prefix()} {T("chat.enter_color_hex")}");
-            }, "#38BDF8", closeOnSelect: true);
-
-            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
-            b.Open(player, pageIdx);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.color", data.ColorHex));
-
-        var presets = new (string Key, string Hex)[]
-        {
-            ("menu.color.white", "#FFFFFF"),
-            ("menu.color.red", "#FF3333"),
-            ("menu.color.green", "#33FF33"),
-            ("menu.color.blue", "#3388FF"),
-            ("menu.color.yellow", "#FFFF33"),
-            ("menu.color.cyan", "#00FFFF"),
-            ("menu.color.orange", "#FFA500"),
-            ("menu.color.magenta", "#DA70D6"),
-            ("menu.color.gold", "#FFD700"),
-            ("menu.color.pink", "#FF69B4"),
-            ("menu.color.lime", "#32CD32"),
-            ("menu.color.grey", "#888888"),
-        };
-
-        foreach (var (presetKey, hex) in presets)
-        {
-            var btn = new ButtonMenuOption(T(presetKey), 1000);
-            var capturedHex = hex;
-            btn.Click += (sender, args) =>
-            {
-                _core.Scheduler.NextTick(() =>
-                {
-                    data.ColorHex = capturedHex;
-                    data.Rainbow = false; // Disable rainbow when selecting static color
-                    Save();
-                    UpdateLiveEntity(data);
-                    SendColoredChat(player, $"{Prefix()} {T("chat.color_changed", capturedHex)}");
-                    OpenColorMenu(player, data.Name);
-                });
-                return ValueTask.CompletedTask;
-            };
-            builder.AddOption(btn);
-        }
-
-        var customHexBtn = new ButtonMenuOption(T("menu.color.custom"), 1000);
-        customHexBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                SetPendingChat(player, ChatPromptKind.ColorHex, data.Name);
-                SendColoredChat(player, $"{Prefix()} {T("chat.enter_color_hex")}");
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(customHexBtn);
-
-        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
-        backBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(backBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, name);
-    }
-
-    // ------------------------------------------------------------------
-    // Sub-Menu: Fine-Tune Position & Angles
-    // ------------------------------------------------------------------
-
-    private void OpenFineTuneMenu(IPlayer player, string name, int pageIdx = 0)
-    {
-        var key = FindKey(name);
-        if (key == null || !_store.TryGetValue(key, out var data))
-        {
-            OpenListMenu(player);
-            return;
-        }
-
-        if (!_playerStepSizes.TryGetValue(player.Slot, out var step))
-        {
-            step = 5f;
-            _playerStepSizes[player.Slot] = step;
-        }
-
-        if (MenuApi != null)
-        {
-            var b = CreateMenuApiBuilder($"wt.finetune.{player.Slot}", $"✦ HASSAS AYAR: {data.Name} ✦", $"Adım: {step:0} birim/derece");
-
-            b.AddItem($"📏 {T("menu.option.step_size", step)}", ctx =>
-            {
-                int curIdx = Array.IndexOf(AvailableSteps, step);
-                int nextIdx = (curIdx + 1) % AvailableSteps.Length;
-                _playerStepSizes[ctx.Player.Slot] = AvailableSteps[nextIdx];
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#FACC15", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_wall_right", step), ctx =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                data.Position[0] += -MathF.Sin(yawRad) * step;
-                data.Position[1] += MathF.Cos(yawRad) * step;
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#38BDF8", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_wall_left", step), ctx =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                data.Position[0] -= -MathF.Sin(yawRad) * step;
-                data.Position[1] -= MathF.Cos(yawRad) * step;
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#38BDF8", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_z_up", step), ctx =>
-            {
-                data.Position[2] += step;
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#4ADE80", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_z_down", step), ctx =>
-            {
-                data.Position[2] -= step;
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#4ADE80", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_wall_out", step), ctx =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                data.Position[0] += MathF.Cos(yawRad) * step;
-                data.Position[1] += MathF.Sin(yawRad) * step;
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_wall_in", step), ctx =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                data.Position[0] -= MathF.Cos(yawRad) * step;
-                data.Position[1] -= MathF.Sin(yawRad) * step;
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_pitch_up", step), ctx =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] + step);
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_pitch_down", step), ctx =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] - step);
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_yaw_left", step), ctx =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] - step);
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_yaw_right", step), ctx =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] + step);
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_roll_pos", step), ctx =>
-            {
-                data.Angles[2] = NormalizeAngle(data.Angles[2] + step);
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.nudge_roll_neg", step), ctx =>
-            {
-                data.Angles[2] = NormalizeAngle(data.Angles[2] - step);
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#E2E8F0", closeOnSelect: false);
-
-            b.AddItem(T("menu.option.straighten"), ctx =>
-            {
-                float absRoll = MathF.Abs(data.Angles[2]);
-                data.Angles[0] = 0f;
-                data.Angles[2] = absRoll < 45f ? 0f : absRoll > 135f ? 180f : 90f;
-                Save(); UpdateLiveEntity(data);
-                OpenFineTuneMenu(ctx.Player, data.Name, ctx.PageIndex);
-            }, "#4ADE80", closeOnSelect: false);
-
-            b.AddItem($"⬅️ {T("menu.option.back")}", ctx => OpenDetailMenu(ctx.Player, data.Name), "#FFB000", closeOnSelect: false);
-            b.Open(player, pageIdx);
-            return;
-        }
-
-        var builder = _core.MenusAPI.CreateBuilder();
-        builder.Design.SetMenuTitle(T("menu.title.fine_tune", data.Name));
-
-        var stepBtn = new ButtonMenuOption(T("menu.option.step_size", step), 1000);
-        stepBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                int curIdx = Array.IndexOf(AvailableSteps, step);
-                int nextIdx = (curIdx + 1) % AvailableSteps.Length;
-                _playerStepSizes[player.Slot] = AvailableSteps[nextIdx];
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(stepBtn);
-
-        // Wall-relative sliding (Right / Left / Out / In based on current Yaw)
-        var wallRight = new ButtonMenuOption(T("menu.option.nudge_wall_right", step), 1000);
-        wallRight.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                // Viewer's right when facing the text is (-sin(yaw), cos(yaw))
-                data.Position[0] += -MathF.Sin(yawRad) * step;
-                data.Position[1] += MathF.Cos(yawRad) * step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(wallRight);
-
-        var wallLeft = new ButtonMenuOption(T("menu.option.nudge_wall_left", step), 1000);
-        wallLeft.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                data.Position[0] -= -MathF.Sin(yawRad) * step;
-                data.Position[1] -= MathF.Cos(yawRad) * step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(wallLeft);
-
-        var zUp = new ButtonMenuOption(T("menu.option.nudge_z_up", step), 1000);
-        zUp.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[2] += step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(zUp);
-
-        var zDown = new ButtonMenuOption(T("menu.option.nudge_z_down", step), 1000);
-        zDown.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[2] -= step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(zDown);
-
-        var wallOut = new ButtonMenuOption(T("menu.option.nudge_wall_out", step), 1000);
-        wallOut.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                data.Position[0] += MathF.Cos(yawRad) * step;
-                data.Position[1] += MathF.Sin(yawRad) * step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(wallOut);
-
-        var wallIn = new ButtonMenuOption(T("menu.option.nudge_wall_in", step), 1000);
-        wallIn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                float yawRad = FaceYaw(data) * (MathF.PI / 180f);
-                data.Position[0] -= MathF.Cos(yawRad) * step;
-                data.Position[1] -= MathF.Sin(yawRad) * step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(wallIn);
-
-        // World-axis X / Y nudges
-        var xPos = new ButtonMenuOption(T("menu.option.nudge_x_pos", step), 1000);
-        xPos.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[0] += step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(xPos);
-
-        var xNeg = new ButtonMenuOption(T("menu.option.nudge_x_neg", step), 1000);
-        xNeg.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[0] -= step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(xNeg);
-
-        var yPos = new ButtonMenuOption(T("menu.option.nudge_y_pos", step), 1000);
-        yPos.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[1] += step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(yPos);
-
-        var yNeg = new ButtonMenuOption(T("menu.option.nudge_y_neg", step), 1000);
-        yNeg.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Position[1] -= step;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(yNeg);
-
-        // Pitch (Up / Down tilt)
-        var pitchUp = new ButtonMenuOption(T("menu.option.nudge_pitch_up", step), 1000);
-        pitchUp.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] + step);
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(pitchUp);
-
-        var pitchDown = new ButtonMenuOption(T("menu.option.nudge_pitch_down", step), 1000);
-        pitchDown.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[0] = NormalizeAngle(data.Angles[0] - step);
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(pitchDown);
-
-        // Yaw (Horizontal rotation)
-        var yawLeft = new ButtonMenuOption(T("menu.option.nudge_yaw_left", step), 1000);
-        yawLeft.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] - step);
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(yawLeft);
-
-        var yawRight = new ButtonMenuOption(T("menu.option.nudge_yaw_right", step), 1000);
-        yawRight.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[1] = NormalizeAngle(data.Angles[1] + step);
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(yawRight);
-
-        // Roll (Sideways banking)
-        var rollRight = new ButtonMenuOption(T("menu.option.nudge_roll_pos", step), 1000);
-        rollRight.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[2] = NormalizeAngle(data.Angles[2] + step);
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(rollRight);
-
-        var rollLeft = new ButtonMenuOption(T("menu.option.nudge_roll_neg", step), 1000);
-        rollLeft.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                data.Angles[2] = NormalizeAngle(data.Angles[2] - step);
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(rollLeft);
-
-        var straighten = new ButtonMenuOption(T("menu.option.straighten"), 1000);
-        straighten.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() =>
-            {
-                // Snap to the nearest clean orientation: floor (roll 0), wall upright (roll 90) or ceiling (roll 180)
-                float absRoll = MathF.Abs(data.Angles[2]);
-                data.Angles[0] = 0f;
-                data.Angles[2] = absRoll < 45f ? 0f : absRoll > 135f ? 180f : 90f;
-                Save();
-                UpdateLiveEntity(data);
-                OpenFineTuneMenu(player, data.Name);
-            });
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(straighten);
-
-        var backBtn = new ButtonMenuOption(T("menu.option.back"), 1000);
-        backBtn.Click += (sender, args) =>
-        {
-            _core.Scheduler.NextTick(() => OpenDetailMenu(player, data.Name));
-            return ValueTask.CompletedTask;
-        };
-        builder.AddOption(backBtn);
-
-        var menu = builder.Build();
-        ShowMenu(player, menu, name);
-    }
 }
